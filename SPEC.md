@@ -62,6 +62,28 @@ Updated by each project's manager. Three triggers:
 
 The Board is read by you (primary user), the Brainstorm Room's two brains (when they need cross-project context), and by other managers if relevant.
 
+#### The `.ceo/board.md` file format
+
+Each project's board entry is stored in `.ceo/board.md` with YAML frontmatter:
+
+```markdown
+---
+goal: <one sentence>
+state: <one or two sentences>
+next_move: <one strong phrase>
+blockers: <list, or empty string if none>
+updated_at: <ISO 8601 timestamp>
+---
+
+# Board
+
+<freeform manager note, if any — human-readable prose, optional>
+```
+
+The Worker's `/api/board` aggregation parses the YAML frontmatter for the glance view. The body is read-only narrative for humans; it doesn't affect the aggregation.
+
+When the manager emits `post_to_board`, the Worker constructs this file format from the structured fields and commits it. Round-tripping (manager reads board.md on session start, sees the structured fields in its context) preserves the data shape.
+
 ### 3. The Brainstorm Room
 
 The thinking space. Separate full surface (not a project pane).
@@ -92,6 +114,30 @@ Brain 1's system prompt: [`prompts/brain-1.md`](prompts/brain-1.md)
 Brain 2's system prompt: [`prompts/brain-2.md`](prompts/brain-2.md)
 
 The Brainstorm Room is for thinking, wandering, cross-cutting conversation. **It is not where you ask about specific project issues.** Those go to the project's manager.
+
+#### Two-brain orchestration
+
+The BrainstormDO orchestrates which brain speaks on each turn:
+
+1. **User message arrives.** Call Brain 1 first.
+2. **Brain 1 responds.** Stream Brain 1's reply to the client (prefixed with `event: speaker, data: {"brain": "brain1"}`).
+3. **Parse Brain 1's response for a `tag_brain_2` fenced block.** If present, fire a Brain 2 call with Brain 1's full reply + the `why` field as additional context. Stream Brain 2's reply (prefixed with `event: speaker, data: {"brain": "brain2"}`).
+4. **If the user explicitly addresses Brain 2** (the BrainstormDO parses for "Brain 2," "what does Brain 2 think," or similar lightweight heuristics on the user's message): skip Brain 1, call Brain 2 only.
+5. **Brain 2 can tag Brain 1 back** via a `tag_brain_1` fenced block. Symmetric mechanism. The DO can run a few back-and-forths but caps at a safe limit (3 brain calls per user turn) to avoid loops.
+
+Tag block format:
+
+````
+```tag_brain_2
+why: <short reason — what Brain 2 might want to weigh in on>
+```
+````
+
+The DO parses these out before persisting the message (so the user doesn't see the raw tag block in chat history — they see the labeled brain replies, that's it).
+
+#### Brainstorm message persistence
+
+Each brain reply is a separate row in `messages` with `role = 'assistant'` and `brain = 'brain1'` or `brain = 'brain2'`. User messages have `brain = NULL`. The chat history is read back in `created_at` order; the frontend renders each row labeled by speaker.
 
 ### The dropnote box (cross-surface)
 
@@ -133,8 +179,18 @@ Workers are the only path to code changes in user repos. Workers always require 
 - **Durable Objects** — one per project (ManagerDO), one for the brain pair (BrainstormDO), one for the agent connection (AgentHubDO)
 - **D1** — operational state (chat sessions, messages, dropnotes, projects-as-chat-plumbing rows, worker job state)
 - **Local agent** — a Node process on the user's machine, persistent websocket to the AgentHubDO, executes Claude Code workers locally and streams output back
-- **Frontend** — Vite + React + TypeScript + Tailwind. SPA, single bundle, ships from the same Worker.
+- **Frontend** — Vite + React + TypeScript + Tailwind v3. SPA, single bundle, ships from the same Worker.
 - **GitHub API** — for repo list, file reads, file writes (`.ceo/` directory commits on claim)
+
+### Cloudflare bindings
+
+Pin these names from day one:
+
+- `DB` — D1 database binding
+- `MANAGER_DO` — ManagerDO Durable Object namespace
+- `BRAINSTORM_DO` — BrainstormDO Durable Object namespace
+- `AGENT_HUB_DO` — AgentHubDO Durable Object namespace
+- `ASSETS` — static assets binding (modern `[assets]` block in wrangler.toml, with `not_found_handling = "single-page-application"` for client routing)
 
 ### Data model
 
@@ -148,7 +204,7 @@ Each claimed repo has a `.ceo/` directory at the root:
   goal.md        — what this project is for, user's words
   context.md     — what the manager needs to know to be useful here
   decisions.md   — log of significant decisions with dates
-  board.md       — current state snapshot (goal, state, next, blockers)
+  board.md       — current state snapshot (goal, state, next, blockers) with YAML frontmatter
   uploads/       — files the user has dropped in the manager chat
                    (created lazily on first upload)
 ```
@@ -177,7 +233,7 @@ CREATE TABLE messages (
   id TEXT PRIMARY KEY,                  -- UUID
   chat_id TEXT NOT NULL,
   role TEXT NOT NULL,                   -- 'user' | 'assistant' | 'system'
-  brain TEXT,                           -- 'brain1' | 'brain2' | NULL (NULL for manager surfaces)
+  brain TEXT,                           -- 'brain1' | 'brain2' | NULL (NULL for manager surfaces and user messages)
   content TEXT NOT NULL,
   attachments TEXT,                     -- JSON array of attachment metadata (paths, types)
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -218,24 +274,23 @@ That's the whole schema. If D1 is wiped, projects-as-repos still exist on GitHub
 
 #### ManagerDO
 
-One per project (addressed by `idFromName(projectId)`).
+One per project. **Addressed by `idFromName(repo_full_name)`** — using the GitHub repo's full name as the natural key. Survives D1 wipes: if D1 is reset and the same repo is re-claimed, the same DO instance is reached.
 
 Handles:
 - `POST /chat` — streamed chat turn with the manager (system prompt = MANAGER_PROMPT + project context from `.ceo/`)
 - `GET /manager-chat` — idempotent resolve: find or create the canonical manager chat for this project, return `{ chatId, projectId, created }`
 - `POST /board-post` — write `.ceo/board.md` via GitHub API; returns the commit sha
+- `POST /ceo-update` — write to one of the `.ceo/` files (goal, context, decisions); returns the commit sha
 
-Internal storage: 60-second TTL cache of the four `.ceo/` content files, fetched fresh after expiry. Cache invalidated on any `board-post` or other write.
+Internal storage: 60-second TTL cache of the four `.ceo/` content files (goal.md, context.md, decisions.md, board.md). On cache miss, fetch via a single GitHub API call (either `git/trees/<sha>?recursive=1` on the `.ceo/` tree, or the directory listing endpoint — implementation choice, just one round-trip). Cache invalidated on any `board-post` or `ceo-update`.
 
 #### BrainstormDO
 
 Singleton (addressed by `idFromName("singleton")`).
 
 Handles:
-- `POST /chat` — streamed chat turn with the brains. The DO orchestrates *which brain speaks*:
-  - User message → call Brain 1 first; if Brain 1's response indicates "Brain 2 might want to chime in," fire a second call to Brain 2 with Brain 1's response as context. Both responses stream to the client, labeled.
-  - User explicitly addresses Brain 2 ("what does Brain 2 think?") → call Brain 2 only.
-- `GET /resolve` — idempotent resolve: find or create the canonical Brainstorm Room chat, return `{ chatId, created }`.
+- `POST /chat` — streamed chat turn with the brains, orchestrating Brain 1 / Brain 2 per the protocol above
+- `GET /resolve` — idempotent resolve: find or create the canonical Brainstorm Room chat, return `{ chatId, created }`
 
 Each brain call builds its system prompt from `prompts/brain-1.md` or `prompts/brain-2.md` plus a context block including:
 - The Board's current state (read from each project's `.ceo/board.md` via cached fetch)
@@ -260,18 +315,16 @@ Forwards job execution to the agent, persists output stream + final diff summary
 A Node process running on the user's machine. Persistent websocket to AgentHubDO via `wss://<worker-domain>/api/agent/ws` with `Authorization: Bearer ${AGENT_TOKEN}`.
 
 On receiving a job dispatch:
-1. Clones the project repo to `~/Projects/<repo-name>` if it isn't already there (uses `clone_url` from the job payload)
+1. Clones the project repo to `<REPOS_DIR>/<repo-name>` if it isn't already there (uses `clone_url` from the job payload)
 2. Invokes Claude Code SDK with the prompt against that repo
 3. Streams stdout/stderr to the websocket
 4. On completion: runs `git diff --stat`, runs `git diff`, sends a summary back
 
-Same shape as the existing agent in the v1/v2 build. Lift forward whole.
-
-Agent code lives in [`agent/`](agent/).
+Agent code lives in [`agent/`](agent/). For Phase 4, this code can be lifted forward from the existing `mrmicaiah/the-ceo` repo's `agent/` directory — the protocol is unchanged.
 
 ### Frontend
 
-Vite + React + TypeScript + Tailwind. Single bundle.
+Vite + React + TypeScript + Tailwind v3. Single bundle.
 
 #### Layout
 
@@ -290,7 +343,7 @@ Vite + React + TypeScript + Tailwind. Single bundle.
 ```
 
 - **Top dock**: project tabs. Active pane gets 1px accent left-edge bar. Minimized projects show as muted chips with a notification dot when there's activity. Click a tab to switch/restore. Hover reveals × to close from dock. `+` button at right opens the project picker.
-- **Workspace**: edge-to-edge. Pane grid morphs with count: 1 pane = full-width; 2 panes = side-by-side; 3 panes = 2 top + 1 full-width bottom; 4 panes = 2×2.
+- **Workspace**: edge-to-edge. Pane grid morphs with count: 1 pane = full-width; 2 panes = side-by-side; 3 panes = 2 top + 1 full-width bottom; 4 panes = 2×2. Beyond 4 panes: opening a 5th auto-minimizes the least-recently-touched visible pane (LRU rule).
 - **Bottom-left**: dropnote box. Single-line, persistent, text-only. Stays small while typing. Small `^` chevron to peek at recent drops.
 - **Bottom-right**: two buttons. "Brainstorm Room" takes over the workspace as a full surface. "Board" pops up as a drawer from the bottom.
 
@@ -320,7 +373,7 @@ mrmicaiah/another            Make this a project →
 - **Other repos**: user's GitHub repos without `.ceo/`. Each has a "Make this a project →" affordance.
 - **+ New project**: opens a small modal (name + description + private toggle) → creates a new GitHub repo + claims it.
 
-Claiming = create D1 row + commit `.ceo/` scaffold to repo + open as a new project pane.
+Claiming = create D1 row + commit `.ceo/` scaffold to repo + open as a new project pane. The claim endpoint is idempotent: if the repo already has `.ceo/` (e.g., D1 was wiped but the repo is intact), skip the scaffold, upsert the D1 row, return `{ projectId, isNew: false }`.
 
 #### Visual language
 
@@ -340,11 +393,11 @@ Claiming = create D1 row + commit `.ceo/` scaffold to repo + open as a new proje
 ### Endpoints
 
 ```
-GET  /health                              — open, no auth
+GET  /health                              — open, no auth, returns { ok: true, version: <commit-sha> }
 
 # Auth: Bearer AUTH_TOKEN required for everything else except /api/agent/ws
 GET  /api/repos                           — list user's GitHub repos with isProject flag
-POST /api/projects/from-repo              — claim a repo as a project (scaffold .ceo/)
+POST /api/projects/from-repo              — claim a repo as a project (scaffold .ceo/; idempotent)
 POST /api/projects/new                    — create new repo + claim
 GET  /api/projects/:id                    — single project row
 
@@ -360,6 +413,7 @@ GET  /api/board                           — read all .ceo/board.md files, aggr
 
 POST /api/dropnotes                       — capture a dropnote
 GET  /api/dropnotes                       — list unarchived dropnotes
+POST /api/dropnotes/:id/archive           — archive a dropnote (brain-callable)
 
 POST /api/uploads                         — upload a file to .ceo/uploads/ in a project's repo
 GET  /api/jobs/:id                        — snapshot of a worker job
@@ -367,25 +421,6 @@ GET  /api/jobs/:id/stream                 — SSE stream of a running job
 
 WS   /api/agent/ws                        — local agent connection (Bearer AGENT_TOKEN)
 ```
-
-### Brain tools
-
-When the brains need information beyond what's in their context block (Board, dropnotes, brainstorm history), they can call tools that fetch on-demand:
-
-- `read_project_briefing(repo_full_name)` — fetches the `.ceo/` files for a specific project
-- `read_repo_file(repo_full_name, path)` — fetches a specific file from a repo
-- `list_repo_files(repo_full_name)` — fetches the file tree of a repo
-- `read_project_chat(project_id, last_n_messages)` — fetches recent messages from a project's manager chat
-- `propose_new_project(name, description, fromRepo?)` — emits a fenced block that renders as a confirm-affordance for the user
-
-These are Claude tool definitions, surfaced as fenced blocks the brains can emit. The Worker handles them and either fetches the data (read tools) or renders a confirm-affordance (propose_new_project).
-
-### Manager tools
-
-- `dispatch_claude_code(summary, prompt)` — emits a fenced block that renders as a "Run Claude Code →" affordance
-- `post_to_board(...board fields...)` — commits an update to `.ceo/board.md`
-- `update_ceo_file(file, content)` — commits an update to one of the `.ceo/` files (housekeeping)
-- `request_file_upload(prompt)` — surfaces a prompt to the user asking for a file (used when the manager wants context it doesn't have)
 
 ### Streaming protocol
 
@@ -405,7 +440,19 @@ event: error
 data: {"message": "..."}
 ```
 
-Action events are emitted when the model produces an action fenced block, parsed server-side and surfaced as structured events for the frontend to render as inline affordances.
+#### Action parsing under streaming
+
+The Worker streams text deltas as they arrive from the Anthropic API. When a delta contains the opening of a fenced action block (e.g., ```` ```dispatch_claude_code ````, ```` ```post_to_board ````, ```` ```tag_brain_2 ````, etc.), the Worker:
+
+1. Stops emitting `event: text` deltas.
+2. Buffers all subsequent deltas until the closing ```` ``` ```` of that fenced block.
+3. Parses the buffered content into a structured action object.
+4. Emits a single `event: action` with the structured object.
+5. Resumes streaming `event: text` deltas for any content after the fence close.
+
+The frontend renders text deltas as streaming prose and renders action events as inline affordances. The raw fenced blocks are never shown to the user — they're machine instructions, not content.
+
+#### Speaker events (Brainstorm Room only)
 
 For the Brainstorm Room, an additional event identifies which brain is speaking:
 
@@ -414,7 +461,41 @@ event: speaker
 data: {"brain": "brain1"}
 ```
 
-The frontend renders subsequent text events as that brain's speech until the next speaker event.
+The frontend renders subsequent text events as that brain's speech until the next speaker event. The BrainstormDO emits the speaker event before each brain call's stream begins.
+
+### Brain tools
+
+When the brains need information beyond what's in their context block (Board, dropnotes, brainstorm history), they can call tools that fetch on-demand:
+
+- `read_project_briefing(repo_full_name)` — fetches the `.ceo/` files for a specific project
+- `read_repo_file(repo_full_name, path)` — fetches a specific file from a repo
+- `list_repo_files(repo_full_name)` — fetches the file tree of a repo
+- `read_project_chat(project_id, last_n_messages)` — fetches recent messages from a project's manager chat
+- `propose_new_project(name, description, fromRepo?)` — emits a fenced block that renders as a confirm-affordance for the user
+- `archive_dropnote(dropnote_id)` — marks a dropnote as archived
+
+These are Claude tool definitions, surfaced as fenced blocks the brains can emit. The Worker handles them and either fetches the data (read tools), renders a confirm-affordance (`propose_new_project`), or executes the write (`archive_dropnote` — brains have permission to archive dropnotes without user confirmation; archiving is reversible and low-stakes).
+
+### Manager tools
+
+- `dispatch_claude_code(summary, prompt)` — emits a fenced block that renders as a "Run Claude Code →" affordance
+- `post_to_board(goal, state, next_move, blockers, note?)` — commits an update to `.ceo/board.md`
+- `update_ceo_file(file, content)` — commits an update to one of the `.ceo/` files (goal, context, decisions). Housekeeping in the manager's own workspace.
+- `request_file_upload(prompt)` — surfaces a prompt to the user asking for a file (used when the manager wants context it doesn't have)
+
+#### `manager_seen_at` semantics
+
+When the ManagerDO builds a chat prompt for a turn, it queries terminal job rows for this project that the manager hasn't reviewed yet:
+
+```sql
+SELECT * FROM execution_jobs
+WHERE project_id = ?
+  AND status IN ('succeeded', 'failed')
+  AND manager_seen_at IS NULL
+ORDER BY completed_at ASC;
+```
+
+For each result, the DO folds the job's summary + diff into the system prompt as "Recent worker results you haven't reviewed." Then it sets `manager_seen_at = datetime('now')` for those rows. Next turn, those jobs are not re-folded — only newer terminal jobs.
 
 ---
 
@@ -438,7 +519,13 @@ Required on the local agent (in `agent/.env`):
 - `REPOS_DIR` — local directory where the agent clones repos (e.g., `C:\Users\mrmic\Projects`)
 - `ANTHROPIC_API_KEY` — for the Claude Code SDK
 
-All Claude model calls use `claude-opus-4-5`.
+**Model ID:** all Claude model calls use `claude-opus-4-5`. Pin this as a single exported constant `MODEL_ID` in `src/lib/claude.ts` so a future change is one line.
+
+**Local dev:**
+- Vite dev server on `http://localhost:5173`, proxies `/api/*` and `/health` to the Worker.
+- Wrangler dev on `http://localhost:8787` (serves the Worker with `.dev.vars` for local secrets).
+- Run both with `npm run dev` at the root (concurrently).
+- In prod: the Worker serves both `/api/*` and the built SPA bundle via the `[assets]` binding.
 
 ---
 
@@ -449,13 +536,13 @@ The system should be built in phases. Each phase ships a working state.
 **Phase 1: Foundation**
 - Cloudflare Worker scaffold + D1 schema applied
 - Auth gate on `/api/*`
-- `/health` endpoint
-- Frontend scaffold (Vite + React + Tailwind, design language applied)
+- `/health` endpoint returning `{ ok: true, version: <commit-sha> }`
+- Frontend scaffold (Vite + React + Tailwind v3, design language applied)
 - The app loads, shows empty state, no functionality yet
 
 **Phase 2: Picker + claim**
 - `/api/repos` (GitHub list)
-- `/api/projects/from-repo` (claim + scaffold `.ceo/`)
+- `/api/projects/from-repo` (claim + scaffold `.ceo/`; idempotent)
 - `/api/projects/new` (create + claim)
 - Frontend picker (two-section dropdown + new project modal)
 - Clicking a repo claims it and opens a placeholder pane
@@ -469,26 +556,26 @@ The system should be built in phases. Each phase ships a working state.
 **Phase 4: Workers**
 - AgentHubDO + agent websocket
 - `dispatch_claude_code` action support + inline affordance
-- The agent runs locally and executes worker jobs
+- The agent runs locally and executes worker jobs (lift forward from `mrmicaiah/the-ceo/agent/`)
 - The full loop: user asks for code work → manager drafts prompt → user clicks Run → worker executes → diff streams back → manager comments on result
 
 **Phase 5: Dropnotes**
-- `/api/dropnotes` endpoints
+- `/api/dropnotes` endpoints (create, list, archive)
 - DropnoteBox component
 - Persistent capture working
 
 **Phase 6: The Board**
-- `/api/board` aggregation
+- `/api/board` aggregation (parses YAML frontmatter from each `.ceo/board.md`)
 - BoardDrawer pop-out from bottom-right
 - `post_to_board` manager tool
 - Manual trigger buttons
 
 **Phase 7: Brainstorm Room**
-- BrainstormDO with two-brain orchestration
+- BrainstormDO with two-brain orchestration (tag block protocol)
 - `/api/brainstorm/*` endpoints
 - Frontend BrainstormRoom full-surface component
 - Brain tools for cross-project access
-- propose_new_project flow
+- `propose_new_project` flow
 
 **Phase 8: File upload**
 - `/api/uploads` endpoint (commits to `.ceo/uploads/` in repo)
@@ -510,6 +597,7 @@ Each phase requires the previous phases. Don't skip ahead.
 - Wrap-chat reports / status pings (not part of the v3 design; the Board replaces this)
 - Long-term memory beyond `.ceo/` files (sufficient for v0)
 - Token-cost optimization (acceptable for v0)
+- Cookie-based session auth (the static `VITE_AUTH_TOKEN` in the bundle is accepted v0 tradeoff; revisit if URL ever goes public)
 
 ---
 
@@ -528,8 +616,8 @@ the-big-brain/
 │   ├── types.ts
 │   ├── lib/
 │   │   ├── github.ts
-│   │   ├── claude.ts          — Anthropic API client
-│   │   ├── chat.ts            — streaming chat primitive
+│   │   ├── claude.ts          — Anthropic API client, MODEL_ID constant
+│   │   ├── chat.ts            — streaming chat primitive + action parser
 │   │   └── ceoScaffold.ts     — .ceo/ starter file contents
 │   ├── durable-objects/
 │   │   ├── manager.ts
@@ -550,7 +638,7 @@ the-big-brain/
 │       ├── state/             — store + persistence
 │       ├── lib/               — api client, utilities
 │       └── types.ts
-├── agent/                     — local Node agent
+├── agent/                     — local Node agent (Phase 4)
 │   ├── README.md
 │   ├── package.json
 │   ├── .env.example
@@ -561,8 +649,6 @@ the-big-brain/
 ├── wrangler.toml
 └── package.json               — root, workspace config for src + web
 ```
-
-The local agent code can be lifted from the existing `the-ceo` repo's `agent/` directory; it's correct and doesn't need rebuilding.
 
 ---
 
