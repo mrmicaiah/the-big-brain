@@ -19,6 +19,22 @@ Phase 2 is local-only. No deploy.
 
 ---
 
+## Operator prerequisites — required before build starts
+
+Two pieces of operator state must be in place. The build will not start until both are confirmed, matching the Phase 1 `database_id` pattern.
+
+1. **Cloudflare Worker secret.** Run locally:
+   ```
+   wrangler secret put GITHUB_TOKEN
+   ```
+   Paste a classic PAT with `repo` scope (full read/write to private repos). Fine-grained PATs work too if granted appropriate per-repo or org access, but classic is simpler for a single-user setup.
+
+2. **Local `.dev.vars`.** Add `GITHUB_TOKEN=<same-PAT>` to the existing `.dev.vars` so `wrangler dev` reads it in the local environment. The PAT value must match the secret set in step 1.
+
+You set both up on your side; tell me when both are in place. I start the build only after that confirmation.
+
+---
+
 ## Files
 
 ### New (Worker)
@@ -80,8 +96,9 @@ Authenticated (`Bearer AUTH_TOKEN`). Lists the user's repos with claim status.
 **Implementation:**
 
 1. Call `GET https://api.github.com/user/repos?affiliation=owner&sort=updated&per_page=100` with `Authorization: token ${GITHUB_TOKEN}` and `User-Agent: the-big-brain`.
-2. Query D1: `SELECT id, repo_full_name FROM projects` → build `Map<repo_full_name, projectId>`.
-3. Annotate each repo with `isProject` and `projectId` (the latter only when claimed).
+2. **Filter:** `repos.filter((r) => !r.fork && !r.archived)` — carry forward the v2-era pattern. Forks and archived repos don't make sense as project candidates and just clutter the picker.
+3. Query D1: `SELECT id, repo_full_name FROM projects` → build `Map<repo_full_name, projectId>`.
+4. Annotate each remaining repo with `isProject` and `projectId` (the latter only when claimed).
 
 **Response shape:**
 
@@ -153,6 +170,8 @@ Single-commit scaffold sequence (Git Data API):
 - `PATCH /repos/:o/:r/git/refs/heads/:branch` with `sha: <newCommitSha>` → done
 
 Five GitHub API calls per scaffold. Acceptable — this happens once per project ever.
+
+**Empty-file pinning:** `goal.md` and `context.md` are zero-byte by design (the manager's prompt logic treats empty as "ask the user"). Their tree entries **must** be sent with `content: ""` explicitly, **not** omitted from the tree-entry object. Omitting `content` is interpreted by GitHub as "no change" and the file won't exist. Belt-and-suspenders: assert this in `ceoScaffold.ts` with a check that every constant is a string (including `""`).
 
 **Concurrent-claim handling:** the `repo_full_name UNIQUE` constraint catches a double-claim race at the DB level. If `INSERT` fails with a UNIQUE violation, retry the initial `SELECT` and treat as "row already exists."
 
@@ -307,7 +326,26 @@ Returns `null` on no-match so `index.ts` can produce its own 404 (consistent sha
 
 ### `src/lib/github.ts`
 
-Functions (named exports):
+**Header pin.** Every GitHub API call uses **one** header builder:
+
+```ts
+function ghHeaders(env: Env, extra: Record<string, string> = {}): HeadersInit {
+  return {
+    "Authorization": `token ${env.GITHUB_TOKEN}`,
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "the-big-brain",
+    ...extra,
+  };
+}
+```
+
+Two things to lock in here:
+
+- **`token`, not `Bearer`.** Classic PATs authenticate with `Authorization: token <pat>`. `Bearer` works for fine-grained PATs and OAuth user tokens but is inconsistent with classic and confusing as a default — pin `token` for our case.
+- **No duplication.** No function in `github.ts` constructs its own headers inline. Every fetch call goes through `ghHeaders(env)`. This avoids the bug class where one function picks up a future header change and another doesn't.
+
+Functions (named exports), all using `ghHeaders`:
 
 - `listUserRepos(env): Promise<GhRepo[]>`
 - `getRepo(env, fullName): Promise<GhRepo | null>` (returns null on 404)
@@ -315,7 +353,7 @@ Functions (named exports):
 - `scaffoldCeo(env, fullName, branch, scaffoldFiles): Promise<{ commitSha: string }>` — orchestrates the 5-call sequence
 - `createRepo(env, { name, description, private }): Promise<GhRepo>`
 
-Each function shapes its own request and parses the response. Errors throw `GitHubError` with the upstream status + body so route handlers can map to user-facing responses. Headers always include `User-Agent: the-big-brain` (GitHub requires UA) and `Accept: application/vnd.github+json`.
+Errors throw `GitHubError` with the upstream status + body so route handlers can map to user-facing responses.
 
 ### `src/index.ts` (rewritten)
 
@@ -355,7 +393,7 @@ export default {
 
 ### State (`web/src/state/store.ts`)
 
-Zustand + persist middleware. localStorage key: `the-big-brain:v1`.
+Zustand + persist middleware. localStorage key: `the-big-brain`.
 
 ```ts
 type OpenProject = { projectId: string; repoFullName: string };
@@ -379,7 +417,34 @@ type Store = {
 
 Persisted slice: `openProjects`, `focusedProjectId`. The two `*Open` flags and the repo cache are session-only.
 
-On store hydrate: for each persisted `openProject`, fire `GET /api/projects/:id` in the background. If any 404, drop it from the list (silently, no toast).
+**Versioning.** Persist config sets `version: 1` and a `migrate` that returns `null` (i.e., drop the persisted state) for any version mismatch:
+
+```ts
+persist(
+  /* store creator */,
+  {
+    name: "the-big-brain",
+    version: 1,
+    partialize: (s) => ({ openProjects: s.openProjects, focusedProjectId: s.focusedProjectId }),
+    migrate: (_persisted, _fromVersion) => {
+      // No partial-state lift-forward across shape changes. Bump the version
+      // any time the persisted shape changes; old data is silently dropped.
+      // Cheap to re-fetch — projects come back via /api/projects/:id on demand.
+      return undefined;
+    },
+  },
+)
+```
+
+Any change to the persisted shape (e.g., adding `isMinimized` later) bumps `version` to 2; old persisted state from version 1 is dropped without crashing. We never attempt partial-state lift-forward across shape changes — too brittle for the size of state we hold.
+
+**Hydration.** For each persisted `openProject`, fire `GET /api/projects/:id` in the background:
+
+- **404** → silently drop the entry from `openProjects`. D1 doesn't know about this project anymore (likely D1 was wiped); no toast.
+- **401** → drop the persisted state entirely AND force a reload (`window.location.reload()`). A 401 here means the bundle's `VITE_AUTH_TOKEN` and the Worker's `AUTH_TOKEN` no longer agree — bundle/Worker drift, the exact failure mode that ate an hour yesterday. Loud-but-recoverable: blow away local state, reload, the user sees the empty state and a fresh fetch. The next time they try to do anything, they get a clean 401 from `apiFetch` they can act on.
+- **5xx / network** → leave the entry in place but mark the pane with a small "couldn't reach" affordance (Phase 2 stub: just keep the placeholder pane visible; retry on next focus). Don't drop on transient failure.
+
+The 401 reload only fires during initial hydration. Mid-session 401s from `apiFetch` propagate normally and are surfaced by whichever component made the call.
 
 ### `apiFetch` (`web/src/lib/api.ts`)
 
@@ -393,9 +458,13 @@ export class ApiError extends Error {
 }
 
 export async function apiFetch<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
+  // Only set content-type for JSON bodies (string). FormData (Phase 8) must NOT
+  // get a manual content-type — the browser sets multipart/form-data with the
+  // boundary automatically. Setting it manually breaks multipart parsing.
+  const isJsonBody = typeof init.body === "string";
   const headers: Record<string, string> = {
     Authorization: `Bearer ${TOKEN}`,
-    ...(init.body ? { "content-type": "application/json" } : {}),
+    ...(isJsonBody ? { "content-type": "application/json" } : {}),
     ...(init.headers as Record<string, string> | undefined),
   };
   const res = await fetch(path, { ...init, headers });
@@ -517,7 +586,8 @@ Some of these require GitHub mutations — I'll run the read-only / shape checks
 | 6 | `GET /api/repos` with auth → 200 + a JSON `{ repos: [...] }` with `isProject` flags. `mrmicaiah/the-big-brain` should appear and (after first claim) have `isProject: true` | me |
 | 7 | Open `http://localhost:5173/` — picker opens on `+` click and shows the two-section layout, project rows in monospace, hover shows the 1px accent | you |
 | 8 | Click an unclaimed repo → `.ceo/` commit lands on GitHub, pane opens, repo now appears under "Your projects" on re-open of picker | you |
-| 9 | Click the same now-claimed repo again → returns `isNew: false`, no second commit, pane opens | you |
+| 8b | **GitHub verification:** open the claimed repo's working tree on github.com and confirm all five `.ceo/` files exist (`README.md`, `goal.md`, `context.md`, `decisions.md`, `board.md`). Click into `goal.md` and `context.md` and confirm they're empty (zero bytes, not "no file content" missing). Confirm there's exactly **one** new commit titled `Scaffold .ceo/ for The Big Brain`. Don't trust just the API response — this is the integration that breaks subtly. | you |
+| 9 | Click the same now-claimed repo again → returns `isNew: false`, no second commit on the repo's commit history, pane opens | you |
 | 10 | Open "+ New project," create a small test repo (private, name `bb-phase2-test` or similar) → repo created on GitHub with `.ceo/` scaffolded, pane opens | you |
 | 11 | Close the test repo's pane via `×` — disappears from dock and workspace | you |
 | 12 | Refresh the page — surviving open panes restore from localStorage; their D1 rows are re-fetched silently | you |
@@ -541,7 +611,7 @@ If 1–6 pass on my end, I'll commit + push; you run 7–15.
 
 **5. Worker → GitHub egress.** Cloudflare Workers can make outbound HTTPS without special config. No `compatibility_flags` needed beyond `nodejs_compat` which we already have.
 
-**6. localStorage versioning.** The persist key includes `:v1`. If the store shape changes in a future phase, bump to `:v2` to avoid weird hydration bugs from stale shapes.
+**6. localStorage versioning.** Zustand persist `version: 1` + a `migrate` that returns `undefined` (drop persisted state) for any version mismatch. Any change to the persisted shape bumps the `version`; old data is dropped silently rather than partial-lift-forwarded. See the State section for the full config.
 
 **7. Picker outside-click handling.** Standard React pattern — attach a document-level `mousedown` listener while the picker is open; close if the click target isn't inside the picker's ref. Verified to play nice with the `+` button itself.
 
@@ -549,18 +619,6 @@ If 1–6 pass on my end, I'll commit + push; you run 7–15.
 
 ---
 
-## One open question
+## Resolved decisions
 
-**Pane count cap behavior.**
-
-The spec calls for an LRU rule when opening a 5th pane: the least-recently-touched visible pane gets auto-minimized to a top-dock chip. Phase 2 doesn't have the "minimized chip" affordance yet — Phase 3 introduces it more naturally alongside the manager-chat focus state.
-
-Three options:
-
-1. **Soft cap at 4.** Trying to open a 5th pane shows a toast: "4 panes max for now — close one first." (Recommended for Phase 2.)
-2. **Full LRU now.** Implement the minimized-chip state in the dock alongside the tab list. More work; ships a feature that won't actually be exercised by anyone in Phase 2.
-3. **Just let the grid overflow.** Open the 5th pane somewhere ugly. Hostile; rejects the editorial discipline.
-
-Recommending (1). The LRU rule is a Phase 3 deliverable — the spec calls it a "rule," not a Phase 2 deliverable, and the dock chip state is closer to the focus/minimize logic that lands with the manager chat.
-
-Push back if you'd rather do (2) up front.
+**Pane count cap → soft cap at 4 with a toast.** Opening a 5th pane while 4 are already open shows a brief inline message: "4 panes max for now — close one first." No 5th pane is opened. The LRU rule (auto-minimize least-recently-touched + dock chip state) is deferred to Phase 3, where it lands alongside the manager-chat focus logic naturally.
