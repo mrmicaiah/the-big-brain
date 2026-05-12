@@ -1,0 +1,21 @@
+name = "the-big-brain"
+main = "src/index.ts"
+compatibility_date = "2025-05-01"
+compatibility_flags = ["nodejs_compat"]
+
+# GIT_SHA is "dev" locally (also set in .dev.vars). Production deploys override it
+# via `wrangler deploy --var GIT_SHA:<sha>` (see scripts/deploy.mjs).
+[vars]
+GIT_SHA = "dev"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "the-big-brain"
+database_id = "d7d1d269-a23c-404b-997a-fd3f0a5f7556"
+migrations_dir = "src/db/migrations"
+
+[assets]
+directory = "./web/dist"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = true

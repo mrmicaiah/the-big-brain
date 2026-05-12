@@ -1,0 +1,10 @@
+node_modules/
+.dev.vars
+.env
+.wrangler/
+dist/
+.vite/
+*.tsbuildinfo
+.claude/settings.local.json
+.DS_Store
+*.log

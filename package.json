@@ -1,0 +1,23 @@
+{
+  "name": "the-big-brain",
+  "private": true,
+  "version": "0.0.0",
+  "workspaces": ["web"],
+  "scripts": {
+    "dev": "concurrently -n worker,web -c blue,magenta \"npm:dev:worker\" \"npm:dev:web\"",
+    "dev:worker": "wrangler dev",
+    "dev:web": "npm run dev -w web",
+    "build:web": "npm run build -w web",
+    "build": "npm run build:web",
+    "deploy": "npm run build && node scripts/deploy.mjs",
+    "db:apply:local": "wrangler d1 execute DB --local --file=src/db/schema.sql",
+    "db:apply:remote": "wrangler d1 execute DB --remote --file=src/db/schema.sql",
+    "typecheck": "tsc --noEmit && npm run typecheck -w web"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240605.0",
+    "concurrently": "^9.0.1",
+    "typescript": "^5.5.4",
+    "wrangler": "^4.0.0"
+  }
+}
