@@ -26,6 +26,18 @@ Group by purpose. Anything not listed here is deferred to the phase that actuall
 - `.gitignore` — Node, Vite, wrangler, `.dev.vars`, `.wrangler/`, `web/dist/`, `web/node_modules/`
 - `.dev.vars.example` — `AUTH_TOKEN=dev-token` and `GIT_SHA=dev` (committed; real `.dev.vars` is gitignored)
 
+#### Local dev token — pinned
+
+To avoid the "Vite sends one token, Worker expects another" trap, both example env files use the same literal in Phase 1:
+
+| File | Variable | Value |
+|---|---|---|
+| `.dev.vars.example` | `AUTH_TOKEN` | `dev-token` |
+| `web/.env.example` | `VITE_AUTH_TOKEN` | `dev-token` |
+
+The operator copies each `.example` to its real path (`.dev.vars` and `web/.env`) on first setup; the tokens stay matched. In production they're set independently — `wrangler secret put AUTH_TOKEN` on the Worker, `VITE_AUTH_TOKEN` in the build env for the SPA — and the operator is responsible for keeping them equal.
+- `scripts/deploy.mjs` — cross-platform deploy wrapper: shells out to `git rev-parse HEAD`, then spawns `wrangler deploy --var GIT_SHA:<sha>` with stdio inherited. Node-native, runs the same on Windows/macOS/Linux.
+
 ### Worker (`src/`)
 
 - `src/index.ts` — `fetch` handler: route on pathname, auth gate, `/health`, fallthrough to `env.ASSETS.fetch(request)`
@@ -102,7 +114,7 @@ Notes:
     "dev:web": "npm run dev -w web",
     "build:web": "npm run build -w web",
     "build": "npm run build:web",
-    "deploy": "npm run build && wrangler deploy --var GIT_SHA:$(git rev-parse HEAD)",
+    "deploy": "npm run build && node scripts/deploy.mjs",
     "db:apply:local": "wrangler d1 execute DB --local --file=src/db/schema.sql",
     "db:apply:remote": "wrangler d1 execute DB --remote --file=src/db/schema.sql",
     "typecheck": "tsc --noEmit && npm run typecheck -w web"
@@ -116,7 +128,24 @@ Notes:
 }
 ```
 
-The `deploy` `$(git rev-parse HEAD)` substitution is bash; on Windows the user runs from Git Bash or we add a tiny `scripts/deploy.mjs` later. Not a Phase 1 problem — Phase 1 doesn't deploy.
+The `deploy` script calls `scripts/deploy.mjs` — a small Node wrapper that resolves the commit SHA and spawns `wrangler deploy --var GIT_SHA:<sha>` with stdio inherited. Cross-platform from day one (no bash substitution, no Git Bash requirement on Windows). Phase 1 doesn't run deploy, but the wrapper exists so Phase 2 can deploy without a tooling detour.
+
+### `scripts/deploy.mjs` shape
+
+```js
+#!/usr/bin/env node
+import { execSync, spawnSync } from "node:child_process";
+
+const sha = execSync("git rev-parse HEAD", { encoding: "utf8" }).trim();
+const result = spawnSync(
+  "wrangler",
+  ["deploy", "--var", `GIT_SHA:${sha}`],
+  { stdio: "inherit", shell: process.platform === "win32" },
+);
+process.exit(result.status ?? 1);
+```
+
+`shell: true` on Windows so `wrangler` (a `.cmd` shim) resolves through the shell PATH the same way it does on POSIX. ~10 lines, no deps.
 
 ---
 
@@ -299,7 +328,7 @@ This is what loads at `/` after `npm run dev`:
 |                                                                 |
 |                                                                 |
 |                       No projects.                              |   ← Fraunces, large-ish, ink at ~60% opacity, centered
-|                                                                 |
+|        Open a project from the dock above to start.             |   ← Fraunces, smaller, ink at ~40% opacity
 |                                                                 |
 |                                                                 |
 |                                                                 |
@@ -311,8 +340,11 @@ This is what loads at `/` after `npm run dev`:
 
 Concretely:
 
-- **Top dock** — A single row, paper background, ~44px tall, hairline rule along the bottom edge. Empty area on the left (where project tabs will live in Phase 2). A `+` button at the right, drawn as a small square with hairline border, ink glyph. Cursor stays default; clicking it does nothing.
-- **Workspace** — Fills the rest of the height. The phrase **"No projects."** is rendered in Fraunces at ~`text-3xl`, ink at `opacity-60`, centered both axes. That's the only content.
+- **Top dock** — A single row, paper background, ~44px tall, hairline rule along the bottom edge. Empty area on the left (where project tabs will live in Phase 2). A `+` button at the right, drawn as a small square with hairline border, ink glyph. Cursor stays default; clicking it does nothing. Native `title="coming next"` tooltip on hover so the button reads as intentional-but-not-yet-wired rather than broken.
+- **Workspace** — Fills the rest of the height. Two centered lines:
+  - **"No projects."** in Fraunces at ~`text-3xl`, ink at `opacity-60`.
+  - **"Open a project from the dock above to start."** directly below, Fraunces at ~`text-base`, ink at `opacity-40`.
+  Both centered both axes as a single block.
 - **Bottom bar** — A single row, paper background, ~52px tall, hairline rule along the top edge.
   - **Left half:** the dropnote-shaped input. Placeholder text "drop a note…" in Geist italic at low opacity. A `^` chevron button at the right edge of the input. Input is `disabled` so the cursor doesn't even land in it — visible but plainly inert.
   - **Right half:** two text-button-styled affordances, "Brainstorm Room" and "Board," Geist small-caps, hairline border, ink color. Also `disabled`/inert.
@@ -329,10 +361,15 @@ No animations, no streaming pulses, no notification dots, no modals. Editorial r
 4. `curl http://localhost:5173/health` → `{"ok":true,"version":"dev"}` (proxied through Vite to wrangler).
 5. `curl http://localhost:5173/api/foo` → `401 {"error":"unauthorized"}`.
 6. `curl -H "Authorization: Bearer dev-token" http://localhost:5173/api/foo` → `404 {"error":"not_found"}`.
-7. Open `http://localhost:5173/` in a browser — paper background with the visible grain, top dock with `+` on the right, empty workspace with "No projects.", bottom bar with the inert dropnote and two buttons. Fraunces renders for the empty-state line; Geist renders for the buttons and placeholder.
+7. Open `http://localhost:5173/` in a browser — paper background with the visible grain, top dock with `+` on the right (tooltip "coming next" on hover), empty workspace with "No projects." and the muted second line below it, bottom bar with the inert dropnote and two buttons. Fraunces renders for the empty-state lines; Geist renders for the buttons and placeholder.
 8. `npm run typecheck` passes for both Worker and web.
+9. `npm run build` (frontend, via the root `build` script) completes cleanly. Catches broken Vite/Tailwind/TS config in Phase 1 rather than discovering it in Phase 7 when a future change happens to invoke it.
 
 If any of these fail, Phase 1 isn't done.
+
+### Phase 1 is local-only — no deploy
+
+The `deploy` script exists and the `scripts/deploy.mjs` wrapper is wired, but Phase 1 does not run them. Deployment is its own verification step after you've reviewed the running local system. We'll cut a deploy as a separate change.
 
 ---
 
@@ -351,11 +388,13 @@ If any of these fail, Phase 1 isn't done.
 
 ---
 
-## Open question I'd like a call on before I build
+## Resolved: who runs `wrangler d1 create`
 
-**Where do you want `wrangler d1 create` to run?** Options:
+You do, once, locally. You paste the returned `database_id` into `wrangler.toml` and commit it. I never need to touch your Cloudflare account from this environment.
 
-1. **You run it once and paste the ID into `wrangler.toml`** before I commit. Cleanest: I never touch your Cloudflare account.
-2. **I run it as part of build** and commit the resulting ID. Requires that `wrangler` is authenticated to your account in this environment, which it presumably isn't.
+**Build gate:** I will not start the Phase 1 build until that `database_id` is in `wrangler.toml` on `main`. Otherwise `npm run db:apply:local` won't work and the verification step that proves the schema applies cannot pass. The rest of the work depends on it, so the cleanest sequence is:
 
-I'd recommend (1). I'll commit `wrangler.toml` with `database_id = "REPLACE_ME"` and a note in the README's setup section telling future-you (or me, next session) what to run.
+1. You run `wrangler d1 create the-big-brain` locally.
+2. You paste the `database_id` into `wrangler.toml` (I'll commit the file with `database_id = "REPLACE_ME"` so the diff is one line; or I can wait and you commit it directly — your call).
+3. You give the green light.
+4. I execute the build in order: root config → Worker → schema apply → frontend → verification.
