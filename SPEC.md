@@ -601,6 +601,14 @@ Each phase requires the previous phases. Don't skip ahead.
 
 ---
 
+## Known limitations
+
+Things we've consciously decided not to fix in v0. Recorded here so we don't lose track of them when they bite.
+
+- **Repo rename / default-branch rename invalidates DO state.** The ManagerDO is addressed by `idFromName(repo_full_name)`. If the user renames a claimed repo on GitHub, subsequent requests hit a fresh DO with no chat history and no cached `.ceo/` files; the old DO is orphaned. Same shape for default-branch renames — the cached `defaultBranch` in DO storage goes stale and `.ceo/` reads on the wrong branch start failing. Workaround when this bites: re-claim the renamed repo (creates a fresh manager chat) or undo the rename. Real fix would be a redirect/migration path, deferred.
+
+---
+
 ## Repo layout
 
 ```

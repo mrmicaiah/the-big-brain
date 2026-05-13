@@ -288,6 +288,10 @@ export function sseResponse(
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
+      // PROD-TODO: prime the stream with a `:` comment line before the first
+      // event when deployed — Cloudflare may buffer responses under 1KB and
+      // delay the first delta. A leading `:padding...` line (ignored by SSE
+      // clients) forces an early flush. Not needed locally via wrangler dev.
       try {
         for await (const ev of gen) {
           controller.enqueue(
@@ -315,7 +319,7 @@ export function sseResponse(
 }
 ```
 
-`no-transform` matters — some intermediaries will buffer or modify SSE if it isn't there.
+`no-transform` matters — some intermediaries will buffer or modify SSE if it isn't there. The `PROD-TODO` comment above flags the Cloudflare <1KB buffering issue (covered in §"Surprises") so the next person opening this file knows about it without hunting through docs.
 
 ---
 
@@ -366,10 +370,21 @@ When unknown keyword matched in TEXT mode, advance the parser past the fence-ope
 
 ### Lookback buffer
 
-Text deltas come in unpredictable chunks; a fence open like `\n\`\`\`dispatch_claude_code\n` can split across deltas. The parser holds back the last ~80 characters of the buffer before emitting, but only when those trailing characters *contain a backtick* — otherwise it emits everything. This gives:
+Text deltas come in unpredictable chunks; a fence open like `\n\`\`\`dispatch_claude_code\n` can split across deltas. The parser holds back the last `LOOKBACK_BUFFER_CHARS` characters of the buffer before emitting, but only when those trailing characters *contain a backtick* — otherwise it emits everything. This gives:
 
 - Normal prose streams with no perceptible latency (most chunks won't end near a backtick)
 - Pre-fence chunks delay by tens of characters until the parser confirms what's coming
+
+**Pin:** the lookback length is a named exported constant at the top of `src/lib/actionParser.ts`:
+
+```ts
+/** How many trailing characters of the streaming buffer to hold back when a
+ * backtick is present in the tail. Tuned to cover any plausible fence-open
+ * sequence ("\n```<keyword>\n"). Easy to tune, easy to find. */
+export const LOOKBACK_BUFFER_CHARS = 80;
+```
+
+Not a magic number. If a future keyword pushes the maximum fence-open longer than 80 chars, this is the one line to change.
 
 ### Body parsing
 
@@ -548,6 +563,6 @@ If 1–9 pass on my end, I'll do the single commit + push you've been asking for
 
 **3. The Anthropic SDK's `messages.create({ stream: true })` returns a stream where each event needs to be matched on `type` first.** Specifically `content_block_delta` events with `delta.type === "text_delta"` are where text comes from. Other event types (`message_start`, `content_block_start`, `message_stop`, etc.) we ignore in Phase 3. If the SDK adds tool-use events later, we'd want to handle them — for now, text-only.
 
-**4. Repo rename / default-branch rename invalidates DO state.** If you rename a claimed repo on GitHub, the DO addressed by the old `repo_full_name` becomes orphaned and a new DO gets created for the new name (with no chat history). v0 doesn't handle this — flag for the day it bites.
+**4. Repo rename / default-branch rename invalidates DO state.** Pinned in SPEC.md §"Known limitations" so we don't lose track of it across phases. v0 doesn't handle it; workaround when it bites is to re-claim the renamed repo.
 
 **5. The chat composer pulse animation.** Implementation choice: an `@keyframes` opacity oscillation or a translucent ink-marker drawn behind. I'll prototype both in Phase 3 build and pick the one that feels right. Will report back with what shipped.
