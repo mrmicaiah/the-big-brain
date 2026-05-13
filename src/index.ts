@@ -1,5 +1,7 @@
 import type { Env } from "./types";
 import { requireAuth } from "./lib/auth";
+import { dispatch } from "./lib/router";
+import { phase2Routes } from "./routes";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -14,11 +16,13 @@ export default {
     if (url.pathname.startsWith("/api/")) {
       const denied = requireAuth(request, env);
       if (denied) return denied;
-      // No routes yet — Phase 2 onward fills these in.
+
+      const matched = await dispatch(phase2Routes, request, env);
+      if (matched) return matched;
       return json({ error: "not_found" }, 404);
     }
 
-    // Everything else: static assets / SPA fallback (index.html for client-side routes)
+    // Everything else: static assets / SPA fallback
     return env.ASSETS.fetch(request);
   },
 } satisfies ExportedHandler<Env>;

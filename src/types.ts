@@ -3,4 +3,5 @@ export interface Env {
   ASSETS: Fetcher;
   AUTH_TOKEN: string;
   GIT_SHA: string;
+  GITHUB_TOKEN: string;
 }
