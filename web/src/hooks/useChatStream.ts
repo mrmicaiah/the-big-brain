@@ -5,27 +5,37 @@ import type { Segment, ToolEvent } from "../lib/types";
 
 export interface StreamingState {
   segments: Segment[];
+  messageId: string | null;
 }
 
 export interface UseChatStreamOpts {
-  onDone: (final: { rawText: string }) => void;
+  onDone: (final: { rawText: string; messageId: string | null }) => void;
 }
 
+/**
+ * SSE consumer for the manager chat stream. Maintains segmented streaming
+ * state (text + tool + action). Emits the assistant's pre-generated
+ * messageId on `message_start`; this lets in-flight dispatch fences render
+ * as cards keyed to the (eventually-persisted) message id.
+ */
 export function useChatStream(opts: UseChatStreamOpts) {
   const [streaming, setStreaming] = useState<StreamingState | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // Mirror streaming state in a ref so the async stream loop reads latest
-  // without re-creating closures on every state change.
-  const streamingRef = useRef<StreamingState>({ segments: [] });
+  const streamingRef = useRef<StreamingState>({ segments: [], messageId: null });
+  const fenceCounterRef = useRef(0);
 
   function appendText(delta: string) {
     const segs = streamingRef.current.segments;
     const last = segs[segs.length - 1];
     if (last && last.kind === "text") {
       const updated: Segment = { kind: "text", text: last.text + delta };
-      streamingRef.current = { segments: [...segs.slice(0, -1), updated] };
+      streamingRef.current = {
+        ...streamingRef.current,
+        segments: [...segs.slice(0, -1), updated],
+      };
     } else {
       streamingRef.current = {
+        ...streamingRef.current,
         segments: [...segs, { kind: "text", text: delta }],
       };
     }
@@ -34,9 +44,34 @@ export function useChatStream(opts: UseChatStreamOpts) {
 
   function appendTool(tool: ToolEvent) {
     streamingRef.current = {
+      ...streamingRef.current,
       segments: [
         ...streamingRef.current.segments,
         { kind: "tool", name: tool.name, summary: tool.summary, ok: tool.ok },
+      ],
+    };
+    setStreaming(streamingRef.current);
+  }
+
+  function appendAction(action: {
+    type: string;
+    fields: Record<string, string>;
+    raw: string;
+  }) {
+    const messageId = streamingRef.current.messageId;
+    if (!messageId) return; // shouldn't happen — message_start fires first
+    streamingRef.current = {
+      ...streamingRef.current,
+      segments: [
+        ...streamingRef.current.segments,
+        {
+          kind: "action",
+          messageId,
+          fenceIndex: fenceCounterRef.current++,
+          actionType: action.type,
+          fields: action.fields,
+          raw: action.raw,
+        },
       ],
     };
     setStreaming(streamingRef.current);
@@ -51,8 +86,9 @@ export function useChatStream(opts: UseChatStreamOpts) {
 
   const send = useCallback(
     async (args: { projectId: string; chatId: string; message: string }) => {
-      streamingRef.current = { segments: [] };
-      setStreaming({ segments: [] });
+      streamingRef.current = { segments: [], messageId: null };
+      fenceCounterRef.current = 0;
+      setStreaming({ segments: [], messageId: null });
       setError(null);
 
       try {
@@ -66,16 +102,26 @@ export function useChatStream(opts: UseChatStreamOpts) {
         if (!res.body) throw new Error("no response body");
 
         for await (const ev of parseSseStream(res.body)) {
-          if (ev.event === "text") {
-            const delta = (ev.data as { delta: string }).delta;
-            appendText(delta);
+          if (ev.event === "message_start") {
+            const data = ev.data as { messageId: string };
+            streamingRef.current = {
+              ...streamingRef.current,
+              messageId: data.messageId,
+            };
+            setStreaming(streamingRef.current);
+          } else if (ev.event === "text") {
+            appendText((ev.data as { delta: string }).delta);
           } else if (ev.event === "tool") {
             appendTool(ev.data as ToolEvent);
           } else if (ev.event === "action") {
-            // Phase 3.5: silently absorb fenced action blocks (unchanged from
-            // Phase 3 — they light up in Phase 4 / Phase 6).
+            appendAction(
+              ev.data as { type: string; fields: Record<string, string>; raw: string },
+            );
           } else if (ev.event === "done") {
-            opts.onDone({ rawText: concatTextOnly() });
+            opts.onDone({
+              rawText: concatTextOnly(),
+              messageId: streamingRef.current.messageId,
+            });
             setStreaming(null);
             return;
           } else if (ev.event === "error") {
@@ -84,8 +130,10 @@ export function useChatStream(opts: UseChatStreamOpts) {
             return;
           }
         }
-        // Stream ended without explicit done — treat as done
-        opts.onDone({ rawText: concatTextOnly() });
+        opts.onDone({
+          rawText: concatTextOnly(),
+          messageId: streamingRef.current.messageId,
+        });
         setStreaming(null);
       } catch (err) {
         if (err instanceof ApiError) {

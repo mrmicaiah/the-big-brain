@@ -42,10 +42,12 @@ CREATE TABLE IF NOT EXISTS execution_jobs (
   summary TEXT NOT NULL,
   status TEXT NOT NULL,                 -- queued | running | succeeded | failed
   output_stream TEXT,
-  diff_summary TEXT,                    -- JSON: { summary, diffStat, diff } or { error, stage }
+  diff_summary TEXT,                    -- JSON: { summary, diffStat, diff, diffTruncated } or { error, stage }
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   completed_at TEXT,
-  manager_seen_at TEXT                  -- when the manager last folded this result into context
+  manager_seen_at TEXT,                 -- when the manager last folded this result into context
+  message_id TEXT,                      -- assistant message id that emitted the dispatch fence (Phase 4)
+  fence_index INTEGER                   -- which fence within that message, 0-indexed (Phase 4)
 );
 
 CREATE INDEX IF NOT EXISTS idx_projects_repo_full_name ON projects(repo_full_name);
@@ -54,3 +56,4 @@ CREATE INDEX IF NOT EXISTS idx_chats_surface ON chats(surface);
 CREATE INDEX IF NOT EXISTS idx_messages_chat ON messages(chat_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_dropnotes_unarchived ON dropnotes(archived_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_jobs_manager_unseen ON execution_jobs(project_id, status, manager_seen_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_message ON execution_jobs(message_id, fence_index);

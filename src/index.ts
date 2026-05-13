@@ -6,6 +6,7 @@ import { apiRoutes } from "./routes";
 // Export DO classes so the Workers runtime can find them when invoked
 // via env.MANAGER_DO.idFromName(...).get(...).
 export { ManagerDO } from "./durable-objects/manager";
+export { AgentHubDO } from "./durable-objects/agent-hub";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -16,10 +17,13 @@ export default {
       return json({ ok: true, version: env.GIT_SHA });
     }
 
-    // Gated: API routes
+    // Gated: API routes. `/api/agent/ws` is exempt from the AUTH_TOKEN gate —
+    // it uses Bearer AGENT_TOKEN, checked inside its route handler.
     if (url.pathname.startsWith("/api/")) {
-      const denied = requireAuth(request, env);
-      if (denied) return denied;
+      if (url.pathname !== "/api/agent/ws") {
+        const denied = requireAuth(request, env);
+        if (denied) return denied;
+      }
 
       const matched = await dispatch(apiRoutes, request, env);
       if (matched) return matched;

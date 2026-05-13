@@ -1,16 +1,20 @@
 import type { Segment } from "../lib/types";
+import { DispatchCard } from "./DispatchCard";
 
 interface Props {
   segments: Segment[];
+  projectId: string;
+  chatId: string;
 }
 
 /**
  * The in-progress assistant message during a stream. Renders segments in
  * order: text segments as flowing paragraphs (respecting whitespace), tool
- * segments as a hairline-bordered inline status line. The animated ink
- * caret bar sits at the end of the last segment until `done` lands.
+ * segments as hairline-bordered inline status lines, action segments as
+ * inline DispatchCard components. Animated ink caret sits at the end of
+ * the last segment until `done` lands.
  */
-export function StreamingMessage({ segments }: Props) {
+export function StreamingMessage({ segments, projectId, chatId }: Props) {
   const lastIdx = segments.length - 1;
   return (
     <div className="border-b border-hairline px-6 py-4">
@@ -32,17 +36,35 @@ export function StreamingMessage({ segments }: Props) {
               </div>
             );
           }
-          return (
-            <div
-              key={i}
-              className="my-3 flex items-center gap-3 text-xs text-ink/50"
-            >
-              <div className="h-px flex-1 bg-hairline" />
-              <span className="font-mono italic">{s.summary}</span>
-              <div className="h-px flex-1 bg-hairline" />
-              {isLast && <Caret />}
-            </div>
-          );
+          if (s.kind === "tool") {
+            return (
+              <div
+                key={i}
+                className="my-3 flex items-center gap-3 text-xs text-ink/50"
+              >
+                <div className="h-px flex-1 bg-hairline" />
+                <span className="font-mono italic">{s.summary}</span>
+                <div className="h-px flex-1 bg-hairline" />
+                {isLast && <Caret />}
+              </div>
+            );
+          }
+          // action segment
+          if (s.actionType === "dispatch_claude_code") {
+            return (
+              <DispatchCard
+                key={i}
+                projectId={projectId}
+                chatId={chatId}
+                messageId={s.messageId}
+                fenceIndex={s.fenceIndex}
+                summary={s.fields.summary || s.fields.prompt?.split("\n")[0] || "Dispatch worker"}
+                prompt={s.fields.prompt ?? ""}
+              />
+            );
+          }
+          // Other action types absorbed silently
+          return null;
         })}
       </div>
     </div>

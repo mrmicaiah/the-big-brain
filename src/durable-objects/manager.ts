@@ -1,7 +1,11 @@
 import type Anthropic from "@anthropic-ai/sdk";
 import type { Env } from "../types";
 import { readCeoFiles, type CeoFiles } from "../lib/githubFiles";
-import { buildManagerSystemPrompt } from "../lib/managerPrompt";
+import {
+  buildManagerSystemPrompt,
+  formatUnseenJobs,
+  type UnseenJobRow,
+} from "../lib/managerPrompt";
 import { streamChatTurn, type ExecuteToolFn } from "../lib/chat";
 import { sseResponse } from "../lib/sse";
 import { newId } from "../lib/ids";
@@ -136,6 +140,30 @@ export class ManagerDO {
         content: r.content,
       }));
 
+    // Fold in any unseen terminal worker results (Phase 4 manager_seen_at).
+    // Query → format → mark seen atomically inside the turn so a refresh
+    // mid-stream doesn't lose the surface.
+    const unseenJobsRes = await this.env.DB.prepare(
+      `SELECT id, summary, status, diff_summary FROM execution_jobs
+         WHERE project_id = ?
+           AND status IN ('succeeded', 'failed')
+           AND manager_seen_at IS NULL
+         ORDER BY completed_at ASC`,
+    )
+      .bind(ctx.id)
+      .all<UnseenJobRow>();
+    const unseenJobs = unseenJobsRes.results ?? [];
+    const workerResults = formatUnseenJobs(unseenJobs);
+    if (unseenJobs.length > 0) {
+      const placeholders = unseenJobs.map(() => "?").join(",");
+      const ids = unseenJobs.map((j) => j.id);
+      await this.env.DB.prepare(
+        `UPDATE execution_jobs SET manager_seen_at = datetime('now') WHERE id IN (${placeholders})`,
+      )
+        .bind(...ids)
+        .run();
+    }
+
     // Build system prompt
     const project = await this.env.DB.prepare(
       "SELECT clone_url FROM projects WHERE id = ?",
@@ -149,6 +177,7 @@ export class ManagerDO {
       repoFullName: ctx.repoFullName,
       cloneUrl,
       ceoFiles,
+      workerResults,
     });
 
     // Tool dispatch — read-only repo access (Phase 3.5). Same implementations
@@ -174,6 +203,11 @@ export class ManagerDO {
       }
     };
 
+    // Pre-generate the assistant messageId so the frontend can attach
+    // in-flight dispatch fences to it BEFORE the stream completes. Persisted
+    // with the same id at the end of the turn.
+    const assistantMessageId = newId();
+
     // Stream the turn. We need to persist the raw assistant text after the
     // stream completes — wrap the generator so we can capture it.
     const db = this.env.DB;
@@ -183,6 +217,9 @@ export class ManagerDO {
       void,
       unknown
     > {
+      // First frame: tell the client which messageId this turn will persist as.
+      yield { event: "message_start", data: { messageId: assistantMessageId } };
+
       const inner = streamChatTurn({
         env,
         system,
@@ -221,7 +258,7 @@ export class ManagerDO {
           .prepare(
             "INSERT INTO messages (id, chat_id, role, content) VALUES (?, ?, 'assistant', ?)",
           )
-          .bind(newId(), chatId, finalRaw)
+          .bind(assistantMessageId, chatId, finalRaw)
           .run();
       }
     }

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { apiFetch, ApiError } from "../lib/api";
-import type { Message } from "../lib/types";
+import type { Message, JobSnapshot } from "../lib/types";
 import { useChatStream } from "../hooks/useChatStream";
 import { MessageList } from "./MessageList";
 import { Composer } from "./Composer";
@@ -20,18 +20,36 @@ interface ListMessagesResponse {
   messages: Message[];
 }
 
+interface ListJobsResponse {
+  jobs: JobSnapshot[];
+}
+
 export function ChatView({ projectId, repoFullName: _repoFullName }: Props) {
   const [chatId, setChatId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [jobs, setJobs] = useState<JobSnapshot[]>([]);
   const [loading, setLoading] = useState(true);
   const [resolveError, setResolveError] = useState<string | null>(null);
 
-  // Hook setup: when a stream completes, append the assistant message locally.
-  // Server has already persisted; this is the optimistic mirror.
+  // Build a lookup Map: messageId → Map<fenceIndex, JobSnapshot>
+  const jobsByMessage = useMemo(() => {
+    const out = new Map<string, Map<number, JobSnapshot>>();
+    for (const j of jobs) {
+      if (!j.message_id || j.fence_index === null) continue;
+      let inner = out.get(j.message_id);
+      if (!inner) {
+        inner = new Map();
+        out.set(j.message_id, inner);
+      }
+      inner.set(j.fence_index, j);
+    }
+    return out;
+  }, [jobs]);
+
   const onDone = useCallback(
-    (final: { rawText: string }) => {
+    (final: { rawText: string; messageId: string | null }) => {
       const assistantMessage: Message = {
-        id: `local-${Date.now()}`,
+        id: final.messageId ?? `local-${Date.now()}`,
         role: "assistant",
         brain: null,
         content: final.rawText,
@@ -44,7 +62,6 @@ export function ChatView({ projectId, repoFullName: _repoFullName }: Props) {
   const streamOpts = useMemo(() => ({ onDone }), [onDone]);
   const { streaming, error: streamError, send } = useChatStream(streamOpts);
 
-  // Resolve chat + load history
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
@@ -56,11 +73,15 @@ export function ChatView({ projectId, repoFullName: _repoFullName }: Props) {
         );
         if (cancelled) return;
         setChatId(resolved.chatId);
-        const history = await apiFetch<ListMessagesResponse>(
-          `/api/chats/${resolved.chatId}/messages`,
-        );
+        const [history, jobsRes] = await Promise.all([
+          apiFetch<ListMessagesResponse>(
+            `/api/chats/${resolved.chatId}/messages`,
+          ),
+          apiFetch<ListJobsResponse>(`/api/chats/${resolved.chatId}/jobs`),
+        ]);
         if (cancelled) return;
         setMessages(history.messages);
+        setJobs(jobsRes.jobs);
       } catch (err) {
         if (cancelled) return;
         if (err instanceof ApiError) {
@@ -79,7 +100,6 @@ export function ChatView({ projectId, repoFullName: _repoFullName }: Props) {
 
   const onSend = (message: string) => {
     if (!chatId) return;
-    // Optimistic user message
     const userMessage: Message = {
       id: `local-user-${Date.now()}`,
       role: "user",
@@ -113,6 +133,9 @@ export function ChatView({ projectId, repoFullName: _repoFullName }: Props) {
         <MessageList
           messages={messages}
           streamingSegments={streaming?.segments ?? null}
+          projectId={projectId}
+          chatId={chatId ?? ""}
+          jobsByMessage={jobsByMessage}
         />
       </div>
       {streamError && (

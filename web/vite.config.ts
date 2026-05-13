@@ -12,5 +12,11 @@ export default defineConfig({
       "/api": "http://localhost:8787",
       "/health": "http://localhost:8787",
     },
+    // Allow Vite to read files from the sibling `shared/` directory (one level
+    // up from the web workspace). `shared/knownActions.ts` is imported by web
+    // code; without this, Vite's filesystem strict mode refuses the read.
+    fs: {
+      allow: [".", "../shared"],
+    },
   },
 });

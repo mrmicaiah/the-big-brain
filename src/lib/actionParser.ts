@@ -51,7 +51,7 @@ export class ActionParser {
   private currentKeyword = "";
   private currentBody = "";
 
-  constructor(private readonly knownActions: Set<string>) {}
+  constructor(private readonly knownActions: ReadonlySet<string>) {}
 
   /** Feed a text delta from the model; returns events to emit downstream. */
   feed(delta: string): ParserEvent[] {
@@ -214,22 +214,7 @@ function parseActionBody(body: string): Record<string, string> {
   return out;
 }
 
-/** The set of fence keywords the parser treats as actions. Wired full from
- *  the start — Phase 3 only renders text, but later phases will light up
- *  individual action types without re-touching this set. */
-export const KNOWN_ACTIONS: Set<string> = new Set([
-  // Manager tools
-  "dispatch_claude_code",
-  "post_to_board",
-  "update_ceo_file",
-  "request_file_upload",
-  // Brain tools (parser-ready; renders in Phase 7)
-  "tag_brain_1",
-  "tag_brain_2",
-  "read_project_briefing",
-  "read_repo_file",
-  "list_repo_files",
-  "read_project_chat",
-  "propose_new_project",
-  "archive_dropnote",
-]);
+/** Re-exported from shared/knownActions.ts so existing callers (chat.ts, etc.)
+ *  don't need to change their import path. The single source of truth lives
+ *  in the shared module — both Worker and frontend import from there. */
+export { KNOWN_ACTIONS } from "../../shared/knownActions";

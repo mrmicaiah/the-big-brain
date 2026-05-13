@@ -6,3 +6,8 @@ GITHUB_TOKEN=ghp_replace_me
 # Anthropic API key (sk-ant-...). Must match the value set on the Worker via
 # `wrangler secret put ANTHROPIC_API_KEY`.
 ANTHROPIC_API_KEY=sk-ant-replace_me
+# Bearer token for the local agent's WebSocket connection. Distinct from
+# AUTH_TOKEN — the agent uses its own token. Generate a long random value
+# (e.g., `openssl rand -hex 32`). Must match the value set on the Worker via
+# `wrangler secret put AGENT_TOKEN` and the AGENT_TOKEN in agent/.env.
+AGENT_TOKEN=replace_me

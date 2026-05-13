@@ -14,6 +14,8 @@
     "deploy": "npm run build && node scripts/deploy.mjs",
     "db:apply:local": "wrangler d1 execute DB --local --file=src/db/schema.sql",
     "db:apply:remote": "wrangler d1 execute DB --remote --file=src/db/schema.sql",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
     "typecheck": "tsc --noEmit && npm run typecheck -w web"
   },
   "devDependencies": {
