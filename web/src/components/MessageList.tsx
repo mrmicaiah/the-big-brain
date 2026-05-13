@@ -1,14 +1,14 @@
 import { useEffect, useRef } from "react";
-import type { Message } from "../lib/types";
+import type { Message, Segment } from "../lib/types";
 import { MessageItem } from "./MessageItem";
 import { StreamingMessage } from "./StreamingMessage";
 
 interface Props {
   messages: Message[];
-  streamingText: string | null;
+  streamingSegments: Segment[] | null;
 }
 
-export function MessageList({ messages, streamingText }: Props) {
+export function MessageList({ messages, streamingSegments }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
@@ -24,11 +24,11 @@ export function MessageList({ messages, streamingText }: Props) {
   useEffect(() => {
     if (!followRef.current) return;
     bottomRef.current?.scrollIntoView({ behavior: "auto" });
-  }, [messages.length, streamingText]);
+  }, [messages.length, streamingSegments]);
 
   return (
     <div ref={containerRef} onScroll={onScroll} className="h-full overflow-y-auto">
-      {messages.length === 0 && streamingText === null && (
+      {messages.length === 0 && streamingSegments === null && (
         <div className="flex h-full items-center justify-center">
           <p className="font-display text-base text-ink/40">
             No messages yet. Say hello.
@@ -43,7 +43,9 @@ export function MessageList({ messages, streamingText }: Props) {
           createdAt={m.created_at}
         />
       ))}
-      {streamingText !== null && <StreamingMessage text={streamingText} />}
+      {streamingSegments !== null && (
+        <StreamingMessage segments={streamingSegments} />
+      )}
       <div ref={bottomRef} />
     </div>
   );

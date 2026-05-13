@@ -1,28 +1,59 @@
+import type { Segment } from "../lib/types";
+
 interface Props {
-  text: string;
+  segments: Segment[];
 }
 
 /**
- * The in-progress assistant message during a stream. Pulses with a soft
- * ink-marker animation (per SPEC.md visual language). Pulse stops when
- * the parent swaps this for a regular MessageItem on `done`.
+ * The in-progress assistant message during a stream. Renders segments in
+ * order: text segments as flowing paragraphs (respecting whitespace), tool
+ * segments as a hairline-bordered inline status line. The animated ink
+ * caret bar sits at the end of the last segment until `done` lands.
  */
-export function StreamingMessage({ text }: Props) {
+export function StreamingMessage({ segments }: Props) {
+  const lastIdx = segments.length - 1;
   return (
     <div className="border-b border-hairline px-6 py-4">
       <div className="mb-2 flex items-baseline justify-between">
         <span className="font-display text-xs uppercase tracking-widest text-ink/60">
           Manager
         </span>
-        <span className="font-sans text-xs text-ink/40 italic">streaming…</span>
+        <span className="font-sans text-xs italic text-ink/40">streaming…</span>
       </div>
-      <div className="whitespace-pre-wrap font-sans text-sm leading-relaxed text-ink">
-        {text}
-        <span
-          className="ml-1 inline-block h-3 w-[2px] animate-pulse bg-ink/60 align-middle"
-          aria-hidden="true"
-        />
+      <div className="font-sans text-sm leading-relaxed text-ink">
+        {segments.length === 0 && <Caret />}
+        {segments.map((s, i) => {
+          const isLast = i === lastIdx;
+          if (s.kind === "text") {
+            return (
+              <div key={i} className="whitespace-pre-wrap">
+                {s.text}
+                {isLast && <Caret />}
+              </div>
+            );
+          }
+          return (
+            <div
+              key={i}
+              className="my-3 flex items-center gap-3 text-xs text-ink/50"
+            >
+              <div className="h-px flex-1 bg-hairline" />
+              <span className="font-mono italic">{s.summary}</span>
+              <div className="h-px flex-1 bg-hairline" />
+              {isLast && <Caret />}
+            </div>
+          );
+        })}
       </div>
     </div>
+  );
+}
+
+function Caret() {
+  return (
+    <span
+      className="ml-1 inline-block h-3 w-[2px] animate-pulse bg-ink/60 align-middle"
+      aria-hidden="true"
+    />
   );
 }

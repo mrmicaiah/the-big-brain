@@ -112,7 +112,7 @@ export function ChatView({ projectId, repoFullName: _repoFullName }: Props) {
       <div className="min-h-0 flex-1">
         <MessageList
           messages={messages}
-          streamingText={streaming?.text ?? null}
+          streamingSegments={streaming?.segments ?? null}
         />
       </div>
       {streamError && (

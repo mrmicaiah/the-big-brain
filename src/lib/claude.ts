@@ -11,40 +11,70 @@ export function claudeClient(env: Env): Anthropic {
   return new Anthropic({ apiKey: env.ANTHROPIC_API_KEY });
 }
 
-export interface ChatMessage {
-  role: "user" | "assistant";
-  content: string;
-}
+/** Structured events the streaming generator yields. chat.ts is the only
+ *  caller; it maps these into SSE events for the wire. */
+export type ClaudeStreamEvent =
+  | { type: "text_delta"; text: string }
+  | { type: "tool_use_start"; id: string; name: string }
+  | { type: "tool_use_input_delta"; partial: string }
+  | { type: "tool_use_stop" }
+  | { type: "stop"; reason: string | null };
 
 export interface StreamClaudeOpts {
   env: Env;
   system: string;
-  messages: ChatMessage[];
+  messages: Anthropic.MessageParam[];
+  tools?: Anthropic.Tool[];
   maxTokens?: number;
 }
 
 /**
- * Stream a Claude completion. Yields only the text deltas; other event types
- * (`message_start`, `content_block_start`, etc.) are dropped because Phase 3
- * doesn't use tools. Tool-use events would surface here later.
+ * Stream a Claude completion. Yields structured events covering text deltas,
+ * tool-use block boundaries + input deltas, and the final stop_reason.
+ *
+ * Caller (chat.ts) reconstructs the assistant message from the tool_use
+ * events and decides whether to loop (tool_use stop) or finalize (end_turn).
  */
 export async function* streamClaude(
   opts: StreamClaudeOpts,
-): AsyncGenerator<string, void, unknown> {
+): AsyncGenerator<ClaudeStreamEvent, void, unknown> {
   const client = claudeClient(opts.env);
   const stream = await client.messages.create({
     model: MODEL_ID,
     max_tokens: opts.maxTokens ?? 4096,
     system: opts.system,
     messages: opts.messages,
+    ...(opts.tools && opts.tools.length > 0 ? { tools: opts.tools } : {}),
     stream: true,
   });
+
+  // Track which kind of block is currently open so we know whether
+  // content_block_stop should yield tool_use_stop.
+  let currentBlock: "text" | "tool_use" | null = null;
+
   for await (const event of stream) {
-    if (
-      event.type === "content_block_delta" &&
-      event.delta.type === "text_delta"
-    ) {
-      yield event.delta.text;
+    if (event.type === "content_block_start") {
+      if (event.content_block.type === "tool_use") {
+        currentBlock = "tool_use";
+        yield {
+          type: "tool_use_start",
+          id: event.content_block.id,
+          name: event.content_block.name,
+        };
+      } else {
+        currentBlock = "text";
+      }
+    } else if (event.type === "content_block_delta") {
+      if (event.delta.type === "text_delta") {
+        yield { type: "text_delta", text: event.delta.text };
+      } else if (event.delta.type === "input_json_delta") {
+        yield { type: "tool_use_input_delta", partial: event.delta.partial_json };
+      }
+    } else if (event.type === "content_block_stop") {
+      if (currentBlock === "tool_use") yield { type: "tool_use_stop" };
+      currentBlock = null;
+    } else if (event.type === "message_delta") {
+      yield { type: "stop", reason: event.delta.stop_reason ?? null };
     }
   }
 }

@@ -433,12 +433,17 @@ data: {"delta": "..."}
 event: action
 data: {"type": "dispatch_claude_code", "...": "..."}
 
+event: tool
+data: {"id": "toolu_...", "name": "read_repo_file", "input": {...}, "ok": true, "summary": "Read src/lib/router.ts (1.2 KB)"}
+
 event: done
 data: {}
 
 event: error
 data: {"message": "..."}
 ```
+
+`event: tool` fires once per Anthropic tool execution, after the tool completes. The `summary` is for UI rendering (inline hairline-divided status line); the full tool result still flows back to the model as a `tool_result` block inside the Worker — clients don't need to see it. `ok: false` indicates a tool-side refusal (file not found, oversized, etc.); the `summary` carries the reason.
 
 #### Action parsing under streaming
 

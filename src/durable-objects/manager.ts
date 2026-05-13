@@ -1,10 +1,16 @@
+import type Anthropic from "@anthropic-ai/sdk";
 import type { Env } from "../types";
 import { readCeoFiles, type CeoFiles } from "../lib/githubFiles";
 import { buildManagerSystemPrompt } from "../lib/managerPrompt";
-import { streamChatTurn } from "../lib/chat";
+import { streamChatTurn, type ExecuteToolFn } from "../lib/chat";
 import { sseResponse } from "../lib/sse";
 import { newId } from "../lib/ids";
-import type { ChatMessage } from "../lib/claude";
+import { repoReadToolDefinitions } from "../lib/toolDefinitions";
+import {
+  listRepoFiles,
+  readRepoFile,
+  readRepoFiles,
+} from "../lib/repoReadTools";
 
 const CEO_CACHE_TTL_MS = 60_000;
 
@@ -123,9 +129,12 @@ export class ManagerDO {
     )
       .bind(chatId)
       .all<{ role: string; content: string }>();
-    const history: ChatMessage[] = (historyRows.results ?? [])
+    const history: Anthropic.MessageParam[] = (historyRows.results ?? [])
       .filter((r) => r.role === "user" || r.role === "assistant")
-      .map((r) => ({ role: r.role as "user" | "assistant", content: r.content }));
+      .map((r) => ({
+        role: r.role as "user" | "assistant",
+        content: r.content,
+      }));
 
     // Build system prompt
     const project = await this.env.DB.prepare(
@@ -142,9 +151,31 @@ export class ManagerDO {
       ceoFiles,
     });
 
+    // Tool dispatch — read-only repo access (Phase 3.5). Same implementations
+    // are reused by Phase 7's BrainstormDO; they're pure functions of env +
+    // (repoFullName, branch) + input.
+    const env = this.env;
+    const repoFullName = ctx.repoFullName;
+    const branch = ctx.defaultBranch;
+    const executeTool: ExecuteToolFn = async (name, input) => {
+      switch (name) {
+        case "list_repo_files":
+          return listRepoFiles(env, repoFullName, branch, input);
+        case "read_repo_file":
+          return readRepoFile(env, repoFullName, branch, input);
+        case "read_repo_files":
+          return readRepoFiles(env, repoFullName, branch, input);
+        default:
+          return {
+            content: `Unknown tool: ${name}`,
+            is_error: true,
+            summary: `${name} — unknown tool`,
+          };
+      }
+    };
+
     // Stream the turn. We need to persist the raw assistant text after the
     // stream completes — wrap the generator so we can capture it.
-    const env = this.env;
     const db = this.env.DB;
 
     async function* wrappedGen(): AsyncGenerator<
@@ -152,14 +183,20 @@ export class ManagerDO {
       void,
       unknown
     > {
-      const inner = streamChatTurn({ env, system, history });
+      const inner = streamChatTurn({
+        env,
+        system,
+        history,
+        tools: repoReadToolDefinitions,
+        executeTool,
+      });
       let raw = "";
       let result: IteratorResult<{ event: string; data: unknown }, unknown>;
       while (!(result = await inner.next()).done) {
         const ev = result.value;
-        // Capture text deltas for persistence (raw text). We persist the raw
-        // text including action fences so re-parse on history reload yields
-        // the same events.
+        // Capture text deltas for persistence. We persist the raw text
+        // including action fences so re-parse on history reload yields the
+        // same events. Tool round-trips are NOT persisted — see TODO below.
         if (ev.event === "text") {
           const data = ev.data as { delta: string };
           raw += data.delta;
@@ -167,6 +204,7 @@ export class ManagerDO {
           const data = ev.data as { raw?: string };
           if (data.raw) raw += "\n" + data.raw + "\n";
         }
+        // ev.event === "tool" is ephemeral; not added to raw
         yield ev;
       }
       // result.value here is the ChatTurnRecord from the inner generator
@@ -174,6 +212,11 @@ export class ManagerDO {
       const finalRaw = record?.rawAssistantText ?? raw;
       // Persist only if we got real output (avoid persisting empty on errors).
       if (finalRaw) {
+        // TODO: long-conversation support needs a content_blocks JSON column
+        // to preserve full structured tool round-trips (tool_use + tool_result
+        // blocks). Today we persist only the concatenated final text; the
+        // model re-fetches if it needs prior reads on a future turn. Revisit
+        // when re-fetch churn shows up. See docs/phase-3-5-plan.md §"Persistence".
         await db
           .prepare(
             "INSERT INTO messages (id, chat_id, role, content) VALUES (?, ?, 'assistant', ?)",

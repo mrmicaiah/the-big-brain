@@ -31,3 +31,17 @@ export interface ParsedAction {
   fields: Record<string, string>;
   raw: string;
 }
+
+export interface ToolEvent {
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+  ok: boolean;
+  summary: string;
+}
+
+/** A streamed assistant message is an ordered list of segments. Text segments
+ *  hold flowing prose; tool segments mark inline tool-call status lines. */
+export type Segment =
+  | { kind: "text"; text: string }
+  | { kind: "tool"; name: string; summary: string; ok: boolean };
