@@ -42,8 +42,15 @@ export type ParserEvent =
   | { kind: "text"; text: string }
   | { kind: "action"; action: ParsedAction };
 
-const FENCE_OPEN_RE = /\n```([a-z_][a-z0-9_]*)\n/;
-const FENCE_CLOSE_RE = /\n```(?:\n|$)/;
+// Anchor at start-of-buffer OR newline. The original `\n` requirement missed
+// fences when the model emits them at position 0 of the assistant message —
+// no leading prose, no preceding newline — and the entire fence streamed
+// through as raw text deltas (the bug found in production deploy verification).
+// See docs/phase-4-plan.md §"Shared parser contract" — the frontend's
+// splitMessageIntoParts already handles this by prepending "\n" to the
+// content; this fixes the streaming parser to match the contract directly.
+const FENCE_OPEN_RE = /(?:^|\n)```([a-z_][a-z0-9_]*)\n/;
+const FENCE_CLOSE_RE = /(?:^|\n)```(?:\n|$)/;
 
 export class ActionParser {
   private buffer = "";
@@ -147,19 +154,35 @@ export class ActionParser {
 
   /**
    * How much of the current buffer is safe to emit as text without risking
-   * splitting a fence-open across two emissions. Strategy: if there's no
-   * backtick in the last `LOOKBACK_BUFFER_CHARS` chars, emit everything; if
-   * there is a backtick, hold back from the newline before that backtick.
+   * splitting a fence-open across two emissions. Three cases:
+   *
+   *   A. Buffer might be growing into a fence-open at position 0 of the
+   *      buffer (e.g., "```", "```dispatch_claude") — hold the whole buffer
+   *      until either the fence-open regex matches in drain() or enough
+   *      non-fence chars accumulate to rule it out.
+   *
+   *   B. Buffer has a backtick preceded by `\n` somewhere in the lookback
+   *      window — potential fence-open after newline. Hold from that `\n`
+   *      onward; emit everything before.
+   *
+   *   C. Backtick mid-prose with no preceding `\n` and not at position 0
+   *      (e.g., the `route` function — inline code) — safe to emit.
    */
   private safeEmitLength(): number {
+    if (this.buffer.length === 0) return 0;
+
     const tail = this.buffer.slice(-LOOKBACK_BUFFER_CHARS);
     if (!tail.includes("`")) return this.buffer.length;
-    // Locate the first backtick in the tail (in the full buffer)
+
+    // Case A: the whole buffer could still grow into a fence-open at start.
+    if (isStartingFenceOpen(this.buffer)) return 0;
+
+    // Case B: find the earliest backtick in the lookback window. Hold from
+    // the preceding `\n` (if any).
     const tailStartInBuffer = Math.max(0, this.buffer.length - LOOKBACK_BUFFER_CHARS);
     const firstBacktickInTail = tail.indexOf("`");
     const backtickPosInBuffer = tailStartInBuffer + firstBacktickInTail;
-    // Find the last \n before that backtick. If none, the backtick can't be
-    // the start of a fence-open (which requires a preceding \n), so safe to emit.
+
     let nlPos = -1;
     for (let i = backtickPosInBuffer - 1; i >= 0; i--) {
       if (this.buffer[i] === "\n") {
@@ -167,9 +190,26 @@ export class ActionParser {
         break;
       }
     }
-    if (nlPos === -1) return this.buffer.length;
-    return nlPos;
+    if (nlPos !== -1) return nlPos;
+
+    // Case C: inline backtick — safe to emit.
+    return this.buffer.length;
   }
+}
+
+/**
+ * True iff `buf` is a strict prefix of `\`\`\`<keyword>` — i.e., the whole
+ * buffer could grow into a fence-open with additional incoming chars.
+ *
+ * Matches: `"`"`, `"``"`, `"```"`, `"```d"`, `"```dispatch_claude_code"`.
+ * Does not match: `"`x"` (inline backtick + letter — can't grow into ```),
+ * `"```dispatch_claude_code\n"` (already a complete fence-open; drain()
+ * handles that branch).
+ *
+ * Exported for unit tests; not used outside this module.
+ */
+export function isStartingFenceOpen(buf: string): boolean {
+  return /^`{1,3}$/.test(buf) || /^```[a-z_][a-z0-9_]*$/.test(buf);
 }
 
 /**
