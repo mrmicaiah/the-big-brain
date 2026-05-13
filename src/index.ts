@@ -1,7 +1,11 @@
 import type { Env } from "./types";
 import { requireAuth } from "./lib/auth";
 import { dispatch } from "./lib/router";
-import { phase2Routes } from "./routes";
+import { apiRoutes } from "./routes";
+
+// Export DO classes so the Workers runtime can find them when invoked
+// via env.MANAGER_DO.idFromName(...).get(...).
+export { ManagerDO } from "./durable-objects/manager";
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -17,7 +21,7 @@ export default {
       const denied = requireAuth(request, env);
       if (denied) return denied;
 
-      const matched = await dispatch(phase2Routes, request, env);
+      const matched = await dispatch(apiRoutes, request, env);
       if (matched) return matched;
       return json({ error: "not_found" }, 404);
     }

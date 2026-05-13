@@ -19,3 +19,18 @@ directory = "./web/dist"
 binding = "ASSETS"
 not_found_handling = "single-page-application"
 run_worker_first = true
+
+[[durable_objects.bindings]]
+name = "MANAGER_DO"
+class_name = "ManagerDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["ManagerDO"]
+
+# Enable importing Markdown files as text (used for prompts/manager.md).
+# `fallthrough = true` keeps the file visible to other potential loaders.
+[[rules]]
+type = "Text"
+globs = ["**/*.md"]
+fallthrough = true

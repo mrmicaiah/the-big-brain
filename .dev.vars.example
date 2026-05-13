@@ -3,3 +3,6 @@ GIT_SHA=dev
 # Classic GitHub PAT with `repo` scope. Must match the value set on the Worker
 # via `wrangler secret put GITHUB_TOKEN`.
 GITHUB_TOKEN=ghp_replace_me
+# Anthropic API key (sk-ant-...). Must match the value set on the Worker via
+# `wrangler secret put ANTHROPIC_API_KEY`.
+ANTHROPIC_API_KEY=sk-ant-replace_me

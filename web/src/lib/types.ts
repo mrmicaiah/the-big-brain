@@ -17,3 +17,17 @@ export interface Project {
   default_branch: string;
   created_at: string;
 }
+
+export interface Message {
+  id: string;
+  role: "user" | "assistant" | "system";
+  brain: "brain1" | "brain2" | null;
+  content: string;
+  created_at: string;
+}
+
+export interface ParsedAction {
+  type: string;
+  fields: Record<string, string>;
+  raw: string;
+}

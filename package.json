@@ -2,7 +2,9 @@
   "name": "the-big-brain",
   "private": true,
   "version": "0.0.0",
-  "workspaces": ["web"],
+  "workspaces": [
+    "web"
+  ],
   "scripts": {
     "dev": "concurrently -n worker,web -c blue,magenta \"npm:dev:worker\" \"npm:dev:web\"",
     "dev:worker": "wrangler dev",
@@ -19,5 +21,8 @@
     "concurrently": "^9.0.1",
     "typescript": "^5.5.4",
     "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.95.2"
   }
 }

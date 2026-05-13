@@ -1,4 +1,5 @@
 import { useStore } from "../state/store";
+import { ChatView } from "./ChatView";
 
 interface Props {
   projectId: string;
@@ -34,10 +35,8 @@ export function ProjectPane({ projectId, repoFullName }: Props) {
           ×
         </button>
       </div>
-      <div className="flex flex-1 items-center justify-center">
-        <p className="font-display text-base text-ink/40">
-          Manager lands here in Phase 3.
-        </p>
+      <div className="min-h-0 flex-1">
+        <ChatView projectId={projectId} repoFullName={repoFullName} />
       </div>
     </div>
   );
