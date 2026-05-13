@@ -137,7 +137,7 @@ Could have a single `read_repo` with a discriminated union. Three is cleaner bec
 3. If 404 → return `{ content: "Directory not found: <path>", is_error: true }`.
 4. Map entries to `{ name, type, size? }` (only `file` and `dir` types; symlinks/submodules are noted but not traversed).
 5. Sort: dirs first alphabetically, then files alphabetically.
-6. Return `content` as a JSON-string summary the model can read directly:
+6. **Output contract — directories show with trailing slashes.** This is the visual cue that distinguishes them from files in the text listing. Files render as `name (size)`; dirs render as `name/` with no size. Implementation must enforce this; the example below is the exact shape callers (and the model) will see:
 
 ```
 src/
@@ -151,7 +151,7 @@ README.md (1.6 KB)
 SPEC.md (32 KB)
 ```
 
-A one-line-per-entry text rendering is friendlier to the model than a deeply nested JSON tree. The model can parse it intuitively.
+A one-line-per-entry text rendering is friendlier to the model than a deeply nested JSON tree. The model can parse it intuitively, and the trailing-slash convention is universal-enough that no legend is needed.
 
 ### `readRepoFile({ path })`
 
@@ -245,6 +245,8 @@ export async function* streamChatTurn(opts: ChatTurnOpts): AsyncGenerator<SseEve
 
 **Tool round-trip cap (`MAX_TOOL_ROUNDS = 5`).** Anthropic models don't typically loop unnecessarily, but a hard cap means a misbehaving prompt or runaway pattern can't burn through tokens indefinitely. Five round-trips is plenty for "list, read three files, summarize."
 
+**Graceful wrap-up when the cap is hit.** Don't just stop mid-loop. After the 5th round if the model still wants to call tools, fire **one final non-tool Anthropic call** with a synthetic system message appended: `"Tool round limit reached. Respond with what you have."` (tools omitted from this call so the model has no choice but to wrap up in prose). Stream that response normally through the action parser; then emit `done`. Cleaner failure than an abrupt cut — the user gets whatever summary the model can produce from what it's already read.
+
 **ActionParser persistence across rounds.** One parser instance for the whole turn. Each round's text completes cleanly when the model decides to call tools (so `finish()` is safe to call at round boundaries; mode resets to text, buffer drains). Fenced action blocks split across tool round-trips don't happen in normal model output.
 
 ---
@@ -293,6 +295,18 @@ Reducer:
 - `tool` event → push new `tool` segment
 - `done` → finalize, hand off to `ChatView.onDone`
 
+### Tool event summary format — pinned contract
+
+The `summary` field on a `tool` event always follows one of these shapes. The frontend assumes this format; tool implementations must produce it. Consistent format makes the UI scanable.
+
+| Tool | Success | Failure |
+|---|---|---|
+| `list_repo_files` | `Listed <path>` (or `Listed /` for root) | `Listed <path> — <reason>` |
+| `read_repo_file` | `Read <path> (<size>)` | `Read <path> — <reason>` |
+| `read_repo_files` | `Read <N> files` | `Read <N> files — <reason>` (when the whole call fails; partial failures still surface as success here and per-file errors are inside the result text) |
+
+`<size>` is human-readable (`1.2 KB`, `412 B`, `34 KB`). `<reason>` is a short clause (`File not found`, `File too large: 412 KB`, `Not text`, `Path required`).
+
 `StreamingMessage` renders segments in order. Text segments render as flowing paragraphs (whitespace-pre-wrap). Tool segments render as a small hairline-bordered inline divider:
 
 ```
@@ -321,17 +335,30 @@ When a tool-use round-trip completes within a single user turn, the manager's fu
 
 When this becomes a problem (chat gets long, model re-fetches the same file 10 times across the conversation), we'll add a `content_blocks` column and proper structured persistence. Not now.
 
+**Pin the awareness in code.** At the persistence site in `manager.ts` (the `INSERT INTO messages ... role='assistant'` call), add a `// TODO` comment:
+
+```ts
+// TODO: long-conversation support needs a content_blocks JSON column to
+// preserve full structured tool round-trips (tool_use + tool_result blocks).
+// Today we persist only the concatenated final text; model re-fetches if it
+// needs prior reads on a future turn. Revisit when re-fetch churn shows up.
+```
+
+So the next person to open this file (probably future-us, partway into Phase 7 or after a long chat surfaces the issue) sees the deferral clearly without hunting through plan docs.
+
 ---
 
 ## `prompts/manager.md` change
 
-A single addition near the "What you have" section:
+A single paragraph added near the "What you have" section, leading with the affirmative behavior (read the file; don't ask for paste):
 
 ```markdown
-- **The repo.** You have read access to its code, structure, README, and commit history. You know what's there. **Use the `read_repo_file` and `list_repo_files` tools when you need to look at something — don't ask the user to paste. The tools are GET-only and safe to call without checking first.**
+- **The repo.** You have read access to its code, structure, README, and commit history. You know what's there.
+
+  You have read access to the repo via three tools: `list_repo_files`, `read_repo_file`, `read_repo_files`. Use them freely. If you need to know what's in a file, **read it** — don't ask the user to paste it. The tools are GET-only and don't require confirmation.
 ```
 
-The bolded portion is the only new text. Tells the model the affordance exists and to use it freely rather than route through the user.
+Leading with the affirmative ("use them freely … read it") shapes the model's default behavior more strongly than a negation-first version would. Tool descriptions themselves still come through the API's `tools` parameter — we don't repeat the schemas in prose.
 
 ---
 
@@ -343,7 +370,7 @@ Steps 1–9 are mine. Steps 10–13 are yours (the visual + behavioral checks).
 |---|---|---|
 | 1 | `npm install` (no new deps) | me |
 | 2 | `npm run typecheck` clean | me |
-| 3 | `npm run build` clean | me |
+| 3 | `npm run build` clean **and** grep the dist bundle for `Use them freely` — confirms the `[[rules]] Text` import baked the updated `prompts/manager.md` into the worker bundle. Without this check, the prompt change could land in the source file but not in the running Worker (a rebuild is required for any text-imported file to refresh). | me |
 | 4 | `npm run dev` brings up wrangler (Vite may or may not, depending on 5173) | me |
 | 5 | `POST /api/projects/<id>/manager/chat` with `{ chatId, message: "list the contents of src/lib" }`. Expect the SSE stream to include: text → `tool` event with `name: "list_repo_files"` and `ok: true` → text. Capture raw bytes | me |
 | 6 | Same project, `{ message: "what does src/lib/router.ts do? read it." }`. Expect: text → `tool` event for `read_repo_file` → final text mentions specific exports from router.ts (proves the read actually happened) | me |
