@@ -62,7 +62,10 @@ Build does not start until all three are confirmed.
 - `src/types.ts` — add `AGENT_HUB_DO: DurableObjectNamespace` and `AGENT_TOKEN: string` to `Env`.
 - `src/index.ts` — export `{ AgentHubDO }` alongside `{ ManagerDO }`.
 - `src/routes/index.ts` — add four routes (`dispatch-claude-code`, `jobs/:id`, `jobs/:id/stream`, `agent/ws`).
-- `src/durable-objects/manager.ts` — pre-generate the assistant `messageId` before the streaming turn begins, emit it as a new `event: message_start` SSE frame so the frontend can attach in-flight dispatches to it; persist the assistant row using that same id.
+- `src/durable-objects/manager.ts` — three changes:
+  1. Pre-generate the assistant `messageId` before the streaming turn begins; emit it as a new `event: message_start` SSE frame so the frontend can attach in-flight dispatches to it; persist the assistant row using that same id.
+  2. **Fold in unseen worker results.** Before building the system prompt, query `SELECT id, summary, diff_summary, status FROM execution_jobs WHERE project_id = ? AND status IN ('succeeded', 'failed') AND manager_seen_at IS NULL ORDER BY completed_at ASC`. For each row, append a "Recent worker results you haven't reviewed" block to the prompt (one entry per row: job id, status, summary, diff_summary parsed JSON — show diffStat if succeeded, error+stage if failed). Then `UPDATE execution_jobs SET manager_seen_at = datetime('now') WHERE id IN (...)`. The fold + mark-seen happens atomically inside the turn so a refresh mid-turn doesn't lose the surface.
+  3. The existing `// TODO: long-conversation support needs a content_blocks JSON column...` comment from Phase 3.5 stays in place — Phase 4's fold-in doesn't change persistence shape.
 - `.dev.vars.example` — add `AGENT_TOKEN=replace-me` line with a comment.
 
 ### New (agent — lift forward from `mrmicaiah/the-ceo/agent/`)
@@ -86,7 +89,8 @@ Lifted verbatim from the v2 build with the rename + a couple of cosmetic adjustm
 - `web/src/components/DispatchCard.tsx` — one inline card for one dispatch fence. Shows summary + collapsible prompt. Button states: "Run Claude Code →" (idle) / "Queued" (queued) / "Running…" (running) / final diff stat + summary (succeeded) / error pane (failed). Connects to its `JobStream` once dispatched.
 - `web/src/components/DiffView.tsx` — minimal diff renderer. Stat block on top (Geist mono), unified diff body below (JetBrains Mono, hairline border, no syntax highlighting in v0). Truncation banner if the diff was capped.
 - `web/src/components/MessageItem.tsx` — **rewritten**. Splits assistant content into text + action parts; renders text inline, action parts as DispatchCard components.
-- `web/src/lib/messageParts.ts` — `splitMessageIntoParts(content): Part[]` — small regex-based splitter for the persisted raw text. Returns `{ kind: "text", text } | { kind: "action", type, fields, raw }` parts in order.
+- `web/src/lib/messageParts.ts` — `splitMessageIntoParts(content): Part[]` — small regex-based splitter for the persisted raw text. Returns `{ kind: "text", text } | { kind: "action", type, fields, raw }` parts in order. **Imports `KNOWN_ACTIONS` from the shared module** (see below); never duplicates the list.
+- `shared/knownActions.ts` — single source of truth for the set of fence keywords the system treats as actions. Both `src/lib/actionParser.ts` (Worker) and `web/src/lib/messageParts.ts` (frontend) import from this file. Two-line module: `export const KNOWN_ACTIONS = new Set([...] as const)`. Web bundler (Vite) gets `server.fs.allow` extended to include `../shared`; both tsconfigs add `shared/**/*` to `include`.
 - `web/src/hooks/useJobStream.ts` — SSE subscriber for `/api/jobs/:id/stream`. Yields `{ snapshot, outputs, terminal }` state.
 - `web/src/lib/types.ts` — `JobSnapshot`, `JobOutputFrame`, `DiffSummary` types.
 
@@ -260,6 +264,16 @@ The `message_start` SSE event lands the assistant's `messageId` in the hook stat
 
 `MessageItem` parses `assistant.content` with `splitMessageIntoParts`. For each `action` part of type `dispatch_claude_code`, look up the job by `(message_id, fence_index)` and render with that snapshot. Cards without a backing job render with the "Run Claude Code →" button still active — the user can dispatch retroactively, which is the spec's user-confirmation contract.
 
+### Shared parser contract
+
+The streaming `ActionParser` (Worker, runs as text deltas arrive) and `splitMessageIntoParts` (frontend, runs on persisted text on history reload) must never disagree on what counts as a parseable action fence. Three pins:
+
+1. **Single source of truth.** Both import `KNOWN_ACTIONS` from `shared/knownActions.ts`. The set is defined once. No duplication.
+2. **Unknown fence keywords pass through as text.** Both parsers ignore unrecognized fences (e.g., ```` ```typescript ````, ```` ```bash ````) and emit them as part of the visible prose. Only keywords in `KNOWN_ACTIONS` become structured actions. Same rule on both sides.
+3. **Idempotent on already-parsed text.** Running `splitMessageIntoParts` on the raw assistant content recovers the same action parts that the streaming parser emitted during the live turn. Same regex, same keyword set, same field-parsing logic. A persisted message → re-parse → identical action structure to what flowed through SSE.
+
+If a future phase adds a new action keyword, it gets added to `shared/knownActions.ts` once and both sides pick it up automatically. No coordinated edit risk.
+
 ### `DispatchCard` states
 
 | State | Render |
@@ -331,13 +345,14 @@ Phase 4 verification is *two-sided* — server-side checks I can run alone, plus
 | # | Check |
 |---|---|
 | 13 | Kill PID-on-5173 if needed; open `http://localhost:5173/`; manager pane for `mrmicaiah/the-big-brain` mounts with the chat from Phase 3.5 |
-| 14 | Prompt the manager with a small task that will trigger dispatch: e.g., "Add a one-line trailing comment to the bottom of `src/types.ts` saying `// dispatched by phase 4 verification`. Use `dispatch_claude_code` for this." Manager emits a dispatch fence; `DispatchCard` renders inline |
+| 14 | Prompt the manager with this exact text (prescriptive — keeps the test deterministic): **"Use `dispatch_claude_code` to add a one-line trailing comment to `src/types.ts` saying `// dispatched by phase 4 verification`. Run it now."** Manager emits a dispatch fence; `DispatchCard` renders inline. (Once this loop is verified working end-to-end, we can re-test with more natural prompts to see whether the manager reaches for `dispatch_claude_code` on its own.) |
 | 15 | Click "Run Claude Code →". Card transitions to **Queued** → **Running**, output streams in. Agent stdout shows the job ID and the SDK's text/tool_use frames |
 | 16 | Job completes; card shows the diff stat + expandable diff. Open the local repo at `C:\Users\mrmic\Projects\the-big-brain` — `git status` shows the modified `src/types.ts` with the new comment line, **unstaged** (agent did `git reset` after capturing the diff). You decide to commit-and-push or `git restore` to drop |
 | 17 | Refresh the browser. The historical assistant message renders with the same `DispatchCard` still showing the succeeded state and diff — `(message_id, fence_index)` link works |
 | 18 | Stop the agent (`Ctrl+C` in its terminal); ask the manager for another small dispatch and click Run. Card shows **Queued — waiting for agent**. Restart the agent; queued job flushes and runs |
+| 19 | **`manager_seen_at` fold-in.** After step 16 (a job lands terminal), send the manager a plain follow-up message: "what did the worker do?" or "anything to flag from that run?" — *without* re-stating the diff. The manager's reply must reference the actual diff (the file path, the comment text, or the diff stat) — proving it pulled the completed job's `diff_summary` into its prompt automatically. Then `SELECT manager_seen_at FROM execution_jobs WHERE id = <jobId>` — must be non-null after the turn |
 
-The Phase 4 verification surface is much larger than prior phases because we're testing a real distributed system (Worker ↔ DO ↔ WebSocket ↔ local agent ↔ SDK ↔ git). I'll do 1–12; you do 13–18 with me coordinating.
+The Phase 4 verification surface is much larger than prior phases because we're testing a real distributed system (Worker ↔ DO ↔ WebSocket ↔ local agent ↔ SDK ↔ git). I'll do 1–12; you do 13–19 with me coordinating.
 
 ---
 
@@ -347,22 +362,14 @@ The Phase 4 verification surface is much larger than prior phases because we're 
 - **No per-job cancellation UI.** Stop-this-job is deferred. The agent can be killed (Ctrl+C) which will leave the job stuck in `running` — manual cleanup via D1 if needed.
 - **No retry-on-failure.** Failed jobs stay failed; the user re-asks the manager if they want another attempt.
 - **No `post_to_board` / `update_ceo_file` action handlers.** Those are Phase 6 — same fenced-block parser, different action types.
-- **No worker-result fold-in.** The manager's `manager_seen_at` slot stays empty for Phase 4. After a job lands, the manager's next response doesn't automatically reference it; the user has to bring it up. **Hmm — actually this might be a Phase 4 deliverable.** *See "Open question" below.*
 
 ---
 
-## Open question I'd like a call on before I build
+## Resolved decisions
 
-**Should the manager auto-see job results on its next turn?**
+**1. Worker-result fold-in (`manager_seen_at`) ships in Phase 4.** Spec is explicit, the experience without it is broken, and the implementation is ~30 lines in ManagerDO. After a job lands terminal, the manager's *next* turn sees it surfaced naturally: "the worker landed with this diff, here's what I'd do about it." See the ManagerDO additions and verification step 19 below.
 
-The spec's `manager_seen_at` semantics say: when ManagerDO builds a prompt, query terminal jobs with `manager_seen_at IS NULL`, fold each summary + diff stat into the system prompt as "Recent worker results you haven't reviewed," then mark those rows seen.
-
-Phase 4 has all the ingredients (terminal job rows with diff_summary). The fold-in is 30 lines of code in ManagerDO. Two options:
-
-1. **Fold in Phase 4.** End state is more complete — after a job completes, the user's next message to the manager surfaces "I see the worker landed: <summary>. ..." conversationally. Matches the spec's intent fully.
-2. **Defer to Phase 4.5.** Phase 4 ships the dispatch + execute + render loop, and the manager's awareness lands as a small follow-up. Smaller blast radius, cleaner test boundary.
-
-I'd lean (1) — it's cheap and the spec is pretty explicit. But it adds a code path in ManagerDO and one verification step. Your call. If you want (2), I'll write `manager_seen_at` as a known-deferred TODO in the plan and skip the wiring.
+**2. Shared `KNOWN_ACTIONS` contract.** Streaming `ActionParser` (Worker) and history `splitMessageIntoParts` (frontend) MUST agree on what counts as a parseable action fence. They live in different bundles, so a shared module avoids drift. See "Frontend rendering" → "Shared parser contract."
 
 ---
 
@@ -390,18 +397,55 @@ I'd lean (1) — it's cheap and the spec is pretty explicit. But it adds a code 
 
 ## What I'll preserve verbatim from `mrmicaiah/the-ceo/agent/`
 
-Lifting forward without rewriting:
+Lifting forward without rewriting. Lines below were verified by re-reading the source files at plan-write time, not cited from memory.
 
-- The WebSocket reconnect loop (`agent.ts` lines 41–50, 62–129)
+- The WebSocket reconnect loop (`agent.ts` lines 41–50, 62–129) — `Bearer ${agentToken}` upgrade header, 30s heartbeat, 3s reconnect delay
 - The Claude Code SDK message handling for `assistant` / `user` / `result` types (`executor.ts` lines 78–139)
-- The diff capture flow: `git add -A` → diff --cached --stat / --cached → `git reset` (`workspace.ts` lines 70–84)
-- The "fresh clone on first dispatch" semantics (`workspace.ts` lines 37–53)
+- The diff capture flow in `workspace.ts`'s `captureDiff` function (lines 70–84). Verified the specific commands are at:
+  - Line 73 — `safeGit(repoPath, ["add", "-A"])`
+  - Lines 75–76 — `git diff --cached --stat` and `git diff --cached`
+  - Line 79 — `safeGit(repoPath, ["reset"])` to leave working tree dirty
+- The "fresh clone on first dispatch" semantics (`workspace.ts` lines 37–53) — clone if missing, no-op if `.git/` already present, refuse unsafe repo names
 - The terminal `{ type: "completed" | "failed", ... }` message shapes
 - The 600-character `truncateSummary` heuristic (`executor.ts` lines 201–207)
 
-Adjustments only:
+Adjustments to the verbatim lift:
 - Package name → `the-big-brain-agent`
 - README references → "The Big Brain"
 - `.env.example` `WORKER_URL` default → `ws://localhost:8787/api/agent/ws`
+- **A new comment block added at the `query()` call site in `executor.ts`** explaining why `permissionMode: "bypassPermissions"` is intentional. Exact text:
+
+  ```ts
+  // SECURITY NOTE: permissionMode "bypassPermissions" skips Claude Code's
+  // per-tool-call user confirmation. This is INTENTIONAL for The Big Brain:
+  //   1. The user approved this entire dispatch by clicking "Run Claude Code →"
+  //      in the frontend before this code runs.
+  //   2. The agent runs on the user's own machine; the user owns the FS.
+  //   3. The agent does `git reset` after capturing diffs, so changes stay
+  //      unstaged — user reviews with git before pushing.
+  // Tightening this (per-call confirmation) would break the "click once to
+  // dispatch a worker" contract. Don't change without rethinking the UX.
+  ```
+
+  Goes immediately above the `for await (const message of query({...})` block. The first time someone reaches to tighten the permission model, this comment stops them from doing it without understanding the contract.
 
 The agent is the most-tested piece of v2 code we have. Lifting it whole keeps risk concentrated in the new Worker code.
+
+## How `ANTHROPIC_API_KEY` reaches the SDK
+
+Verified by reading `mrmicaiah/the-ceo/agent/node_modules/@anthropic-ai/claude-code/` (the installed SDK at v1.0.128). The plumbing:
+
+1. `agent/src/index.ts` starts with `import "dotenv/config"` — this loads `agent/.env` into `process.env` at module init, before anything else runs.
+2. `agent/src/executor.ts` calls `query({ prompt, options: { cwd, permissionMode } })` from `@anthropic-ai/claude-code` — **without** passing an `apiKey` option. The SDK doesn't accept one on `query()`.
+3. The SDK's `query()` spawns the Claude Code CLI as a child process. The child inherits `process.env` (standard Node `child_process` behavior).
+4. The bundled SDK inside the CLI reads `ANTHROPIC_API_KEY` from its own `process.env` via a helper that walks `globalThis.process.env`:
+
+   ```js
+   var t31=(A)=>{if(typeof globalThis.process!=="undefined")return globalThis.process.env?.[A]?.trim()??void 0;...};
+   // and later:
+   class C3{constructor({...apiKey:B=t31("ANTHROPIC_API_KEY")??null,...}={}){...}}
+   ```
+
+End-to-end: `.env` → dotenv → `process.env` (Node) → inherited by CLI child process → SDK reads from CLI's `process.env`. No explicit pass-through code needed. Lifting forward verbatim preserves this — `executor.ts` calls `query()` plainly and relies on the env chain.
+
+If this stops working in a future SDK version, verification step 11 (agent connects + runs job) would fail with an Anthropic 401 from inside the SDK. We'd catch it before merge.
