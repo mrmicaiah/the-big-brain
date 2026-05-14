@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { apiFetch, ApiError } from "../lib/api";
 import type { JobSnapshot, DiffSummary } from "../lib/types";
 import { useJobStream } from "../hooks/useJobStream";
@@ -14,15 +14,25 @@ interface Props {
   /** If known at render time (history reload), pre-populated. Otherwise null
    *  for a freshly-streamed action that hasn't been dispatched yet. */
   existingJob?: JobSnapshot | null;
+  /** When true, the card POSTs /dispatch-claude-code on mount instead of
+   *  waiting for a button click. StreamingMessage passes true (the card is
+   *  fresh from the current turn — user permission is implicit). MessageItem
+   *  passes false (a historical card from a previous turn is not implicit
+   *  permission to fire on browser reload). */
+  autoDispatch?: boolean;
 }
 
 /**
- * One dispatch action card. Five states (per docs/phase-4-plan.md):
- *   - Idle: button shown, no job yet. Click → POST /dispatch-claude-code.
- *   - Queued: waiting for agent
- *   - Running: live output preview
- *   - Succeeded: diff stat + expandable diff
- *   - Failed: error + stage
+ * One dispatch action card. States:
+ *   - Idle:       no job yet. Historical-only state — fresh-stream cards
+ *                 auto-dispatch on mount and skip this state entirely.
+ *   - Queued:     waiting for agent
+ *   - Running:    live output preview
+ *   - Succeeded:  diff stat + expandable diff
+ *   - Failed:     error + stage
+ *
+ * Auto-dispatch fires at most once per component lifetime, gated by a ref so
+ * React's StrictMode double-mount in dev can't trigger two dispatches.
  */
 export function DispatchCard({
   projectId,
@@ -32,11 +42,13 @@ export function DispatchCard({
   summary,
   prompt,
   existingJob = null,
+  autoDispatch = false,
 }: Props) {
   const [jobId, setJobId] = useState<string | null>(existingJob?.id ?? null);
   const [dispatching, setDispatching] = useState(false);
   const [dispatchError, setDispatchError] = useState<string | null>(null);
   const [showPrompt, setShowPrompt] = useState(false);
+  const hasAutoDispatched = useRef(false);
 
   // Stream live state for the job (whether existing or freshly dispatched)
   const stream = useJobStream(jobId);
@@ -76,7 +88,7 @@ export function DispatchCard({
     if (existingJob?.id) setJobId(existingJob.id);
   }, [existingJob?.id]);
 
-  const onRun = async () => {
+  const onRun = useCallback(async () => {
     setDispatching(true);
     setDispatchError(null);
     try {
@@ -105,7 +117,20 @@ export function DispatchCard({
     } finally {
       setDispatching(false);
     }
-  };
+  }, [projectId, chatId, messageId, fenceIndex, summary, prompt]);
+
+  // Fresh-stream auto-dispatch: fire on mount once when StreamingMessage
+  // passed autoDispatch=true and the card has no backing job yet. Guard with
+  // a ref so React StrictMode's double-mount in dev doesn't dispatch twice.
+  useEffect(() => {
+    if (!autoDispatch) return;
+    if (hasAutoDispatched.current) return;
+    if (jobId) return;
+    if (existingJob) return;
+    if (dispatching) return;
+    hasAutoDispatched.current = true;
+    void onRun();
+  }, [autoDispatch, jobId, existingJob, dispatching, onRun]);
 
   return (
     <div className="my-4 border border-hairline bg-paper">
@@ -131,14 +156,22 @@ export function DispatchCard({
 
       {status === "idle" && (
         <div className="px-4 py-3">
-          <button
-            type="button"
-            onClick={onRun}
-            disabled={dispatching}
-            className="border border-ink bg-paper px-4 py-2 font-sans text-sm text-ink hover:bg-ink hover:text-paper disabled:opacity-50"
-          >
-            {dispatching ? "Dispatching…" : "Run Claude Code →"}
-          </button>
+          {autoDispatch ? (
+            // Fresh-stream card: useEffect is firing onRun; show the
+            // dispatching state directly instead of a click affordance.
+            <p className="font-display text-sm text-ink/50">Dispatching…</p>
+          ) : (
+            // Historical card: no auto-fire (autoDispatch defaults to false
+            // for MessageItem). User can still dispatch retroactively.
+            <button
+              type="button"
+              onClick={onRun}
+              disabled={dispatching}
+              className="border border-ink bg-paper px-4 py-2 font-sans text-sm text-ink hover:bg-ink hover:text-paper disabled:opacity-50"
+            >
+              {dispatching ? "Dispatching…" : "Run Claude Code →"}
+            </button>
+          )}
           {dispatchError && (
             <p className="mt-2 font-sans text-xs text-ink">{dispatchError}</p>
           )}

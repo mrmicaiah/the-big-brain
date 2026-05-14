@@ -41,7 +41,11 @@ export async function* streamClaude(
   const client = claudeClient(opts.env);
   const stream = await client.messages.create({
     model: MODEL_ID,
-    max_tokens: opts.maxTokens ?? 4096,
+    // Default 16K for generous headroom on long responses (especially when the
+    // model includes large dispatch_claude_code prompt bodies or detailed
+    // review prose). Opus 4-5 supports up to 32K output; 16K leaves room
+    // without going to the cap.
+    max_tokens: opts.maxTokens ?? 16384,
     system: opts.system,
     messages: opts.messages,
     ...(opts.tools && opts.tools.length > 0 ? { tools: opts.tools } : {}),

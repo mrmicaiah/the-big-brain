@@ -60,6 +60,7 @@ export function StreamingMessage({ segments, projectId, chatId }: Props) {
                 fenceIndex={s.fenceIndex}
                 summary={s.fields.summary || s.fields.prompt?.split("\n")[0] || "Dispatch worker"}
                 prompt={s.fields.prompt ?? ""}
+                autoDispatch={true}
               />
             );
           }
