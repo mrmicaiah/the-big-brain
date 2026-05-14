@@ -24,6 +24,14 @@ export function useChatStream(opts: UseChatStreamOpts) {
   const streamingRef = useRef<StreamingState>({ segments: [], messageId: null });
   const fenceCounterRef = useRef(0);
 
+  // Every setStreaming call below passes `{ ...streamingRef.current }`, not the
+  // ref's value directly. React's setState bail-out uses Object.is on the new
+  // vs. prior state — across async iterations of the SSE consumer, passing the
+  // ref reference can leave the bail-out thinking nothing changed, suppressing
+  // re-renders in prod (events buffer up; cards don't appear until the stream
+  // closes). Spread → fresh object → guaranteed re-render. One shallow copy
+  // per event is cheap; the bug if you skip it is invisible streaming.
+
   function appendText(delta: string) {
     const segs = streamingRef.current.segments;
     const last = segs[segs.length - 1];
@@ -39,7 +47,7 @@ export function useChatStream(opts: UseChatStreamOpts) {
         segments: [...segs, { kind: "text", text: delta }],
       };
     }
-    setStreaming(streamingRef.current);
+    setStreaming({ ...streamingRef.current });
   }
 
   function appendTool(tool: ToolEvent) {
@@ -50,7 +58,7 @@ export function useChatStream(opts: UseChatStreamOpts) {
         { kind: "tool", name: tool.name, summary: tool.summary, ok: tool.ok },
       ],
     };
-    setStreaming(streamingRef.current);
+    setStreaming({ ...streamingRef.current });
   }
 
   function appendAction(action: {
@@ -74,7 +82,7 @@ export function useChatStream(opts: UseChatStreamOpts) {
         },
       ],
     };
-    setStreaming(streamingRef.current);
+    setStreaming({ ...streamingRef.current });
   }
 
   function concatTextOnly(): string {
@@ -108,7 +116,7 @@ export function useChatStream(opts: UseChatStreamOpts) {
               ...streamingRef.current,
               messageId: data.messageId,
             };
-            setStreaming(streamingRef.current);
+            setStreaming({ ...streamingRef.current });
           } else if (ev.event === "text") {
             appendText((ev.data as { delta: string }).delta);
           } else if (ev.event === "tool") {
