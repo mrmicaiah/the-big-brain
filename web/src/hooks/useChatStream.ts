@@ -33,6 +33,13 @@ export function useChatStream(opts: UseChatStreamOpts) {
   // per event is cheap; the bug if you skip it is invisible streaming.
 
   function appendText(delta: string) {
+    // DIAGNOSTIC: remove after Bug 3 is resolved
+    console.log(
+      "[useChatStream] appendText",
+      delta.slice(0, 20),
+      "segs now",
+      streamingRef.current.segments.length,
+    );
     const segs = streamingRef.current.segments;
     const last = segs[segs.length - 1];
     if (last && last.kind === "text") {
@@ -48,6 +55,11 @@ export function useChatStream(opts: UseChatStreamOpts) {
       };
     }
     setStreaming({ ...streamingRef.current });
+    // DIAGNOSTIC: remove after Bug 3 is resolved
+    console.log(
+      "[useChatStream] setStreaming fired with segments=",
+      streamingRef.current.segments.length,
+    );
   }
 
   function appendTool(tool: ToolEvent) {

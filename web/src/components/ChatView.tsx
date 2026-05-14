@@ -111,6 +111,12 @@ export function ChatView({ projectId, repoFullName: _repoFullName }: Props) {
     void send({ projectId, chatId, message });
   };
 
+  // DIAGNOSTIC: remove after Bug 3 is resolved
+  console.log(
+    "[ChatView] render, streaming?",
+    streaming === null ? "null" : `segs=${streaming.segments.length}`,
+  );
+
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center">

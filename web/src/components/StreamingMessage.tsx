@@ -15,6 +15,13 @@ interface Props {
  * the last segment until `done` lands.
  */
 export function StreamingMessage({ segments, projectId, chatId }: Props) {
+  // DIAGNOSTIC: remove after Bug 3 is resolved
+  console.log(
+    "[StreamingMessage] render, segments=",
+    segments.length,
+    "first text=",
+    segments.find((s) => s.kind === "text")?.text?.slice(0, 30),
+  );
   const lastIdx = segments.length - 1;
   return (
     <div className="border-b border-hairline px-6 py-4">

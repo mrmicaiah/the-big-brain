@@ -18,6 +18,11 @@ export function MessageList({
   chatId,
   jobsByMessage,
 }: Props) {
+  // DIAGNOSTIC: remove after Bug 3 is resolved
+  console.log(
+    "[MessageList] render, streamingSegments=",
+    streamingSegments === null ? "null" : streamingSegments.length,
+  );
   const bottomRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const followRef = useRef(true);
