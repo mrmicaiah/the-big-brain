@@ -25,7 +25,7 @@ export type MessagePart =
       fenceIndex: number;
     };
 
-const FENCE_RE = /\n```([a-z_][a-z0-9_]*)\n([\s\S]*?)\n```(?=\n|$)/g;
+const FENCE_RE = /(?:^|\n)```([a-z_][a-z0-9_]*)\n([\s\S]*?)\n```(?=\n|$)/g;
 
 export function splitMessageIntoParts(content: string): MessagePart[] {
   const parts: MessagePart[] = [];
