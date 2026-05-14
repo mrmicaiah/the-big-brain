@@ -278,6 +278,11 @@ export class AgentHubDO {
       )
         .bind(body.jobId)
         .run();
+      // Tell live SSE subscribers the job transitioned out of 'queued'.
+      // Without this they see the initial snapshot (status='queued') and
+      // wait silently until the first 'output' frame from the agent —
+      // which on a fresh cold clone can be tens of seconds.
+      this.broadcast(body.jobId, "status_change", { status: "running" });
     }
     return jsonResponse({ ok: true, dispatched: sent });
   }
@@ -329,6 +334,7 @@ export class AgentHubDO {
         )
           .bind(job.id)
           .run();
+        this.broadcast(job.id, "status_change", { status: "running" });
         // Only one at a time globally (we re-enter via terminal handler)
         return;
       }
@@ -372,6 +378,7 @@ export class AgentHubDO {
         )
           .bind(job.id)
           .run();
+        this.broadcast(job.id, "status_change", { status: "running" });
         return;
       }
     }

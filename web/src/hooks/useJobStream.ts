@@ -60,6 +60,17 @@ export function useJobStream(jobId: string | null): JobStreamState {
             setSnapshot(ev.data as JobSnapshot);
           } else if (ev.event === "output") {
             setOutputs((prev) => [...prev, ev.data as JobOutputFrame]);
+          } else if (ev.event === "status_change") {
+            // queued → running transition (emitted by AgentHubDO when the
+            // job is sent to the agent). Mirror into the snapshot so the
+            // DispatchCard's status selector (which reads snapshot.status)
+            // flips the card from "Queued — waiting for agent" to "Running".
+            const change = ev.data as {
+              status: "queued" | "running" | "succeeded" | "failed";
+            };
+            setSnapshot((prev) =>
+              prev ? { ...prev, status: change.status } : prev,
+            );
           } else if (ev.event === "terminal") {
             setTerminal(ev.data as { status: "succeeded" | "failed" } & DiffSummary);
             setLoading(false);
