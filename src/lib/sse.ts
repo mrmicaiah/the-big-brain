@@ -17,10 +17,15 @@ export function sseResponse(
   const encoder = new TextEncoder();
   const stream = new ReadableStream({
     async start(controller) {
-      // PROD-TODO: prime the stream with a `:` comment line before the first
-      // event when deployed — Cloudflare may buffer responses under 1KB and
-      // delay the first delta. A leading `:padding...` line (ignored by SSE
-      // clients) forces an early flush. Not needed locally via wrangler dev.
+      // Prime the stream with an SSE comment line so Cloudflare's edge doesn't
+      // buffer the response. Clients ignore any line starting with ":" per the
+      // SSE spec (https://html.spec.whatwg.org/multipage/server-sent-events.html
+      // #event-stream-interpretation). Without this, small responses (under
+      // ~1KB) get held by Cloudflare's chunked-encoding heuristics — every
+      // text-delta and action event arrives in one batch at the end of the
+      // response rather than streaming live. Locally via wrangler dev the
+      // buffering doesn't happen; this line is the cheap fix for prod.
+      controller.enqueue(encoder.encode(":keep-alive\n\n"));
       try {
         for await (const ev of gen) {
           const frame = `event: ${ev.event}\ndata: ${JSON.stringify(ev.data)}\n\n`;
