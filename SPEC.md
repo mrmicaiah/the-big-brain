@@ -612,6 +612,8 @@ Things we've consciously decided not to fix in v0. Recorded here so we don't los
 
 - **Repo rename / default-branch rename invalidates DO state.** The ManagerDO is addressed by `idFromName(repo_full_name)`. If the user renames a claimed repo on GitHub, subsequent requests hit a fresh DO with no chat history and no cached `.ceo/` files; the old DO is orphaned. Same shape for default-branch renames — the cached `defaultBranch` in DO storage goes stale and `.ceo/` reads on the wrong branch start failing. Workaround when this bites: re-claim the renamed repo (creates a fresh manager chat) or undo the rename. Real fix would be a redirect/migration path, deferred.
 
+- **`schema.sql` snapshot duplicates `migrations/` intent on fresh installs.** Today `src/db/schema.sql` is the current full snapshot AND `src/db/migrations/000N_*.sql` carry every incremental change since Phase 4. For a fresh remote D1, applying `schema.sql` gets you to current; but wrangler's `d1 migrations apply` then errors on the already-applied migration (duplicate column / index). The workaround on Phase 4's first deploy: `INSERT INTO d1_migrations (name) VALUES (...)` manually for each pre-existing migration to mark them applied. Cleanup direction is option (1): **keep `schema.sql` as the historical Phase 1 baseline and let `migrations/` carry every change forward**. The current `db:apply:remote` script would then become a fresh-install path that runs schema.sql + all migrations as one chain, and the snapshot stays frozen. Not blocking; flag for whenever schema changes happen often enough that the dance becomes annoying.
+
 ---
 
 ## Repo layout
